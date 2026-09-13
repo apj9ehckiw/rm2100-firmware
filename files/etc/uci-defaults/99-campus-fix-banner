@@ -1,0 +1,23 @@
+#!/bin/sh
+# Replace default banner with campus-fix usage notes
+cat > /etc/banner <<'EOF'
+ -----------------------------------------------------
+ Redmi RM AC2100 - OpenWrt 24.10 (campus-fix build)
+
+ TTL fix: ACTIVE (nftables)
+   check:   nft list chain inet fw4 campus_ttl_postrouting
+   adjust:  vi /etc/nftables.d/10-campus-ttl-fix.nft (64 <-> 128)
+            then: service firewall restart
+
+ WAN setup: LuCI -> Network -> Interfaces -> wan
+   DHCP auth portal: keep dhcp
+   PPPoE dorm line:  switch proto to pppoe
+
+ Detection notes:
+   TTL        fixed by this build
+   IP-MAC     NAT presents single router MAC (inherent)
+   client#    only the router authenticates (inherent)
+   UA/finger  NOT fixable at router - per-client browsers
+ -----------------------------------------------------
+EOF
+exit 0

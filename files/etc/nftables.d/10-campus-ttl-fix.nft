@@ -1,0 +1,21 @@
+# Campus multi-device TTL fix (fw4 / nftables drop-in)
+#
+# Files in /etc/nftables.d/ are auto-included into the fw4 table on every
+# firewall reload (OpenWrt 24.10 firewall4).
+#
+# Mechanism: campus gateways detect routers by inspecting the TTL of packets
+# arriving from your IP. A direct host emits Windows=128 / Linux-Mac-Android=64.
+# Traffic forwarded through a router shows TTL-1. Setting a fixed TTL on ALL
+# traffic leaving the WAN makes every packet look host-originated.
+#
+# NOTE: default 64 assumes Linux/Mac/Android-style fingerprint. If your campus
+# expects Windows hosts, change 64 -> 128 below and `service firewall restart`.
+#
+# Side effect: outbound traceroute from LAN clients will no longer show hops
+# beyond the router (expected consequence of TTL normalization).
+
+chain campus_ttl_postrouting {
+	type filter hook postrouting priority mangle + 10; policy accept;
+	oifname != "lo" ip ttl set 64 counter comment "campus-fix: normalize IPv4 TTL"
+	oifname != "lo" ip6 hoplimit set 64 counter comment "campus-fix: normalize IPv6 hoplimit"
+}

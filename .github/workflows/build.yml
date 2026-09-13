@@ -1,0 +1,78 @@
+name: Build RM AC2100 OpenWrt firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: "OpenWrt release to build from"
+        required: false
+        default: "24.10.2"
+      include_luci:
+        description: "Include LuCI web UI (true/false)"
+        required: false
+        default: "true"
+
+env:
+  PROFILE: xiaomi_redmi-router-ac2100
+  TARGET: ramips/mt7621
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          sudo apt-get clean
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl xz-utils zstd ca-certificates
+
+      - name: Download OpenWrt ImageBuilder
+        run: |
+          VER="${{ github.event.inputs.openwrt_version || '24.10.2' }}"
+          URL="https://downloads.openwrt.org/releases/${VER}/targets/${TARGET}/openwrt-imagebuilder-${VER}-ramips-mt7621.Linux-x86_64.tar.zst"
+          echo "Downloading: $URL"
+          curl -fL --retry 3 -o imagebuilder.tar.zst "$URL"
+          tar --zstd -xf imagebuilder.tar.zst
+          mv "openwrt-imagebuilder-${VER}-ramips-mt7621.Linux-x86_64" ib
+
+      - name: Include custom files overlay
+        run: |
+          mkdir -p ib/files
+          cp -r files/* ib/files/
+
+      - name: Build firmware
+        working-directory: ib
+        run: |
+          PKGS=""
+          if [ "${{ github.event.inputs.include_luci || 'true' }}" = "true" ]; then
+            PKGS="luci"
+          fi
+          PKGS="$PKGS kmod-ipt-nat ip6tables-nft iptables-nft"
+          make image \
+            PROFILE="$PROFILE" \
+            PACKAGES="$PKGS" \
+            FILES=files/
+
+      - name: List artifacts
+        run: find ib/bin/targets -type f \( -name "*.bin" -o -name "*.manifest" -o -name "sha256sums" \) -exec ls -lh {} \;
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rm2100-firmware-${{ github.event.inputs.openwrt_version || '24.10.2' }}
+          path: |
+            ib/bin/targets/*/*/openwrt-*-xiaomi_redmi-router-ac2100-squashfs-kernel1.bin
+            ib/bin/targets/*/*/openwrt-*-xiaomi_redmi-router-ac2100-squashfs-rootfs0.bin
+            ib/bin/targets/*/*/openwrt-*-xiaomi_redmi-router-ac2100-squashfs-sysupgrade.bin
+            ib/bin/targets/*/*/openwrt-*-xiaomi_redmi-router-ac2100-initramfs-kernel.bin
+            ib/bin/targets/*/*/*.manifest
+            ib/bin/targets/*/*/sha256sums
+          retention-days: 30
