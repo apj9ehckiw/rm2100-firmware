@@ -3,7 +3,7 @@
 红米 RM AC2100（MediaTek MT7621A，128MB RAM / 16MB flash）专用 OpenWrt 固件，
 内置**校园网多设备检测规避**套件，通过 GitHub Actions 云端构建，本机无需 Linux 环境。
 
-当前固件版本：**v2.1.0**（`/etc/campus-fix-version`，Actions 里可用 `fw_version` 输入改）
+当前固件版本：**v2.2.0**（`/etc/campus-fix-version`，Actions 里可用 `fw_version` 输入改）
 
 ## 使用方法
 
@@ -61,7 +61,19 @@
 | WAN MAC OUI | 首次开机生成持久化的本地管理 MAC，去掉小米 OUI 与"一台 Windows 主机"人设的矛盾 | `97-campus-wan-hygiene` |
 | 栈指纹 | tcp_timestamps/window_scaling 保持开启（关了反而是新异常）、rp_filter 开 | 同上 |
 
-**默认注释掉、需要时再开**（在 `20-campus-egress-hygiene.nft` 里取消注释）：
+### v2.2.0 新增
+
+**LuCI 页面「Campus MAC」**（Network 菜单下）：自定义 WAN MAC 全功能管理——
+- **查看**当前 WAN 口实际生效的 MAC（不是只显示配置值）
+- **手动设置**：填入任意合法 MAC（比如克隆你电脑网卡的 MAC——校园网把认证绑定到
+  你电脑 MAC 时，克隆它路由器就无缝顶替，无需重新注册）
+- **Rotate**：一键换新随机 MAC（本地管理位自动处理）
+- **Reset**：恢复出厂 WAN MAC
+- 留空保存 = 恢复出厂；改完 `ifup wan` 或重启生效；**改 MAC 后需在校园网认证页
+  重新登录**（认证会话绑定 MAC）
+- 页面写入会持久化，重启不丢，也不会被首刷随机逻辑覆盖
+
+### 默认注释掉、需要时再开（在 `20-campus-egress-hygiene.nft` 里取消注释）：
 - **IGMP 出方向 DROP**：多播成员关系报告暴露多接收者。只在不用校园 IPTV 时开。
 - **每主机并发连接数上限**（默认 300，dynamic set 实现）：对抗流数统计。
   开启方式：取消注释 `campus_flowtab4` set 和 `campus_flowcap` chain 两个块。

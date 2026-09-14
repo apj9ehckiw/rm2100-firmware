@@ -1,0 +1,133 @@
+#!/bin/sh
+# campus-fix v2.2: WAN MAC management UI.
+#
+# The firmware already randomizes the WAN MAC on first boot
+# (97-campus-wan-hygiene, persisted in /etc/campus-fix-wanmac and applied
+# via uci network.wan.macaddr). This adds a LuCI page to VIEW and SET it
+# manually, so you can clone your PC's MAC or rotate on demand without ssh.
+#
+# Page: LuCI -> Network -> Campus MAC
+# Uses rpcd/luci-bwc-free plain uci calls; no extra packages needed.
+
+cat > /usr/lib/lua/luci/controller/campus_mac.lua <<'LUAEOF'
+module("luci.controller.campus_mac", package.seeall)
+
+function index()
+	-- only for logged-in admins; lives under Network menu
+	entry({"admin", "network", "campus_mac"},
+		cbi("campus_mac"), _("Campus MAC"), 76).dependent = false
+end
+LUAEOF
+
+mkdir -p /usr/lib/lua/luci/model/cbi
+cat > /usr/lib/lua/luci/model/cbi/campus_mac.lua <<'CBIEOF'
+--[[
+	Campus MAC - view/set the WAN MAC address from LuCI
+	(campus-fix firmware)
+]]--
+
+local sys = require "luci.sys"
+local nw = require "luci.model.network"
+
+m = Map("network", translate("Campus MAC"),
+	translate("The MAC address your router presents to the campus network. " ..
+		"A random locally-administered MAC was generated on first boot. " ..
+		"You can set it manually (e.g. clone your PC's NIC MAC) or rotate it." ..
+		"<br /><br /><b>Format:</b> 6 hex pairs separated by colons, " ..
+		"e.g. <code>12:34:56:78:9A:BC</code>. " ..
+		"Leave empty to go back to the router's factory WAN MAC." ..
+		"<br /><br /><b>Effective after</b> <code>ifup wan</code> or reboot. " ..
+		"Campus portals usually bind the auth session to the MAC - " ..
+		"after changing it, re-login on the portal."))
+
+init = m:section(NamedSection, "wan", "interface", translate("WAN interface"))
+
+mac = init:option(Value, "macaddr", translate("WAN MAC address"))
+mac.rmempty = true
+mac.datatype = "macaddr"
+
+function mac.cfgvalue(self, section)
+	-- show the CURRENT live MAC, not just the uci config value
+	local ntm = nw.init()
+	local net = ntm:get_network("wan")
+	if net then
+		local dev = net:get_interface()
+		if dev then
+			local live = dev:mac()
+			return live or self.map:get(section, "macaddr")
+		end
+	end
+	return self.map:get(section, "macaddr")
+end
+
+function mac.write(self, section, value)
+	if value and #value > 0 then
+		local v = value:lower():gsub("[^0-9a-f:]", "")
+		-- normalize separators to colons
+		local clean = v:gsub("%-", ":")
+		if #clean == 17 then
+			self.map:set(section, "macaddr", clean)
+			-- persist MAC + mode so 97- boot script keeps it
+			local f = io.open("/etc/campus-fix-wanmac", "w")
+			if f then
+				f:write(clean:gsub(":", ""))
+				f:close()
+			end
+			f = io.open("/etc/campus-fix-macmode", "w")
+			if f then f:write("custom") f:close() end
+		end
+	else
+		-- empty: remove override, restore factory WAN MAC
+		self.map:del(section, "macaddr")
+		local f = io.open("/etc/campus-fix-wanmac", "w")
+		if f then f:write("") f:close() end
+		f = io.open("/etc/campus-fix-macmode", "w")
+		if f then f:write("factory") f:close() end
+	end
+end
+
+rotate = init:option(Button, "_rotate", translate("Rotate (new random MAC)"))
+rotate.inputtitle = translate("Generate")
+rotate.inputstyle = "apply"
+
+function rotate.write(self, section)
+	local rand = sys.exec("od -An -N6 -tx1 /dev/urandom | tr -d ' \\n'")
+	rand = rand:gsub("[^0-9a-f]", "")
+	if #rand >= 12 then
+		local b1 = tonumber(rand:sub(1, 2), 16)
+		b1 = bit.band(bit.bor(b1, 0x02), 0xFE)
+		local mac = string.format("%02x%s%s%s%s%s", b1,
+			rand:sub(3, 4), rand:sub(5, 6), rand:sub(7, 8),
+			rand:sub(9, 10), rand:sub(11, 12))
+		self.map:set(section, "macaddr", mac)
+		local f = io.open("/etc/campus-fix-wanmac", "w")
+		if f then f:write(mac:gsub(":", "")) f:close() end
+		f = io.open("/etc/campus-fix-macmode", "w")
+		if f then f:write("custom") f:close() end
+	end
+end
+
+factory = init:option(Button, "_factory", translate("Reset to factory WAN MAC"))
+factory.inputtitle = translate("Reset")
+factory.inputstyle = "reset"
+
+function factory.write(self, section)
+	-- read the factory MAC from the board.json / device tree via ifstatus
+	local out = sys.exec("ubus call system board | jsonfilter -e '@.release.version' 2>/dev/null")
+	local mactxt = sys.exec("cat /sys/class/net/eth0/address 2>/dev/null || true")
+	-- eth0 base MAC = factory; WAN is eth0.2 (base+1 on this board, but keep
+	-- it simple: clear the override and let OpenWrt use its computed default)
+	self.map:del(section, "macaddr")
+	local f = io.open("/etc/campus-fix-wanmac", "w")
+	if f then f:write("") f:close() end
+	f = io.open("/etc/campus-fix-macmode", "w")
+	if f then f:write("factory") f:close() end
+end
+
+return m
+CBIEOF
+
+# reload luci caches so the page appears without manual flush
+rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* 2>/dev/null
+
+exit 0

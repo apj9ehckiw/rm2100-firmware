@@ -13,8 +13,19 @@ sysctl -qw net.ipv4.icmp_echo_ignore_broadcasts=1
 sysctl -qw net.ipv4.conf.all.rp_filter=1
 
 # --- WAN MAC: locally-administered, keeps OUI from screaming "Xiaomi router"
-# Deterministic per-install: generated once, persisted, survives reboots.
+# Three modes (managed via /etc/campus-fix-macmode, LuCI page "Campus MAC"):
+#   "custom"  - user set a MAC in LuCI; /etc/campus-fix-wanmac holds it
+#   "factory" - user wants the factory WAN MAC; no uci override
+#   (absent)  - first boot: generate + persist a random locally-admin MAC
+MODEFILE="/etc/campus-fix-macmode"
 MACFILE="/etc/campus-fix-wanmac"
+MODE=$(cat "$MODEFILE" 2>/dev/null)
+if [ "$MODE" = "factory" ]; then
+  # remove any override; factory MAC comes from OpenWrt's default computation
+  uci -q delete network.wan.macaddr
+  uci -q commit network
+  exit 0
+fi
 if [ ! -s "$MACFILE" ]; then
   # 6 random bytes as 12 hex chars (od is in busybox; hexdump may not be)
   RAND=$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')
@@ -31,5 +42,6 @@ if [ -n "$CMAC" ]; then
   uci -q set network.wan.macaddr="$CMAC"
   uci -q commit network
 fi
+[ -s "$MODEFILE" ] || echo custom > "$MODEFILE"
 
 exit 0
