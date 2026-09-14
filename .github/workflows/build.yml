@@ -59,7 +59,7 @@ jobs:
 
       - name: Validate custom nftables rules
         run: |
-          # nft --check catches syntax errors (e.g. the v2.2.0 'hash' vs
+          # nft -c catches syntax errors (e.g. the v2.2.0 'hash' vs
           # 'jhash' bug) BEFORE they brick fw4 on first boot.
           sudo apt-get install -y nftables
           shopt -s nullglob
@@ -67,9 +67,11 @@ jobs:
           for f in ib/files/etc/nftables.d/*.nft; do
             echo "checking $f"
             # wrap drop-in chains in a scratch table so standalone chain
-            # blocks parse; --check only validates, never applies
+            # blocks parse. Run inside a fresh network namespace with
+            # CAP_NET_ADMIN: nft still opens a netlink socket even with -c,
+            # which plain CI runners deny.
             { echo "table inet fw4check {"; cat "$f"; echo "}"; } > /tmp/check.nft
-            if ! nft --check -f /tmp/check.nft; then
+            if ! sudo unshare --net nft -c -f /tmp/check.nft; then
               echo "SYNTAX ERROR in $f" >&2
               rc=1
             fi
