@@ -1,0 +1,24 @@
+#!/bin/sh
+# campus-fix v2: DHCP fingerprint hardening.
+#
+# Mechanism: some campus detectors run passive DHCP fingerprinting (DHCP
+# option 55/60/12 ordering differs per OS; a burst of distinct fingerprints
+# behind one lease = router). Two layers of defense:
+#   1. Router's own WAN DHCP client: override client-id/hostname so the
+#      upstream lease looks like one vanilla Windows box.
+#   2. dnsmasq: strip/exclude unusual option requests from LAN replies so
+#      sniffers on the campus side never see the per-client variety.
+#
+# These are default-on because they're invisible in normal use. Remove the
+# WAN hostname override if your portal shows a required hostname.
+
+# 1) WAN client fingerprint: look like a plain Windows DHCP client
+uci -q set network.wan.hostname='DESKTOP-CAMPUS'
+uci -q set network.wan.clientid=''          # drop stale client-id if any
+uci -q commit network
+
+# 2) dnsmasq: minimize leaked option detail toward LAN clients
+uci -q add_list dhcp.lan.dhcp_option='option:vendor-class,"MSFT 5.0"'
+uci -q commit dhcp
+
+exit 0

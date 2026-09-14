@@ -1,21 +1,59 @@
-# Campus multi-device TTL fix (fw4 / nftables drop-in)
+# Campus multi-device anti-detection rules (fw4 / nftables drop-in)
 #
-# Files in /etc/nftables.d/ are auto-included into the fw4 table on every
+# Files in /etc/nftables.d/ are auto-included into the inet fw4 table on every
 # firewall reload (OpenWrt 24.10 firewall4).
 #
-# Mechanism: campus gateways detect routers by inspecting the TTL of packets
-# arriving from your IP. A direct host emits Windows=128 / Linux-Mac-Android=64.
-# Traffic forwarded through a router shows TTL-1. Setting a fixed TTL on ALL
-# traffic leaving the WAN makes every packet look host-originated.
+# Chains in this file (each can be tuned independently, see README):
+#   campus_ttl_postrouting  - TTL/hoplimit normalization      (defeats hop-count probe)
+#   campus_ipid_postrouting - IP-ID normalization             (defeats IP-ID entropy fingerprinting)
+#   campus_dscp_postrouting - DSCP/ECN normalization          (defeats QoS-mark-based correlation)
+#   campus_quic_block       - QUIC/HTTP3 block                (forces TLS SNI through TCP for consistent inspection)
 #
-# NOTE: default 64 assumes Linux/Mac/Android-style fingerprint. If your campus
-# expects Windows hosts, change 64 -> 128 below and `service firewall restart`.
-#
-# Side effect: outbound traceroute from LAN clients will no longer show hops
-# beyond the router (expected consequence of TTL normalization).
+# Chains disabled by default (enable in README, they can break some setups):
+#   - MAC randomization per-host (needs per-client config; NAT already hides LAN MACs)
 
+# ---------------------------------------------------------------- TTL fix
+# Mechanism: a direct host emits Windows=128 / Linux-Mac-Android=64. Forwarded
+# traffic shows TTL-1. Normalizing every WAN-bound packet to one value makes
+# the router invisible to hop-count probes.
+# Default 64 = Linux/Mac/Android fingerprint. If the campus expects Windows
+# hosts, change to 128 (both rules) and `service firewall restart`.
 chain campus_ttl_postrouting {
 	type filter hook postrouting priority mangle + 10; policy accept;
 	oifname != "lo" ip ttl set 64 counter comment "campus-fix: normalize IPv4 TTL"
 	oifname != "lo" ip6 hoplimit set 64 counter comment "campus-fix: normalize IPv6 hoplimit"
+}
+
+# ------------------------------------------------------------- IP-ID fix
+# Mechanism: hosts pick IP-ID by different algorithms (per-flow counter,
+# global counter, random). Behind one router, forwarded flows from different
+# OSes produce mixed IP-ID patterns on one source IP - a strong statistical
+# signal that many cheap detectors use. Setting a per-flow random-looking but
+# consistent ID defeats this. nft has no per-flow random, so use hash of the
+# flow tuple: same flow keeps a stable ID, different flows differ.
+chain campus_ipid_postrouting {
+	type filter hook postrouting priority mangle + 12; policy accept;
+	oifname != "lo" ip ttl 64-128 ip id set hash ip saddr ip daddr ip proto mod 65536 counter comment "campus-fix: flow-stable IP-ID"
+}
+
+# ------------------------------------------------------------ DSCP fix
+# Mechanism: LAN clients mark DSCP differently (games/video calls/OS defaults).
+# QoS-correlated probes see many distinct DSCP classes behind one "host".
+# Normalizing to CS0 (best effort, the default for normal apps) erases it.
+# ECN bits kept as-is so TCP negotiation is not broken.
+chain campus_dscp_postrouting {
+	type filter hook postrouting priority mangle + 14; policy accept;
+	oifname != "lo" ip dscp != 0x00 ip dscp set 0x00 counter comment "campus-fix: normalize IPv4 DSCP to CS0"
+	oifname != "lo" ip6 dscp != 0x00 ip6 dscp set 0x00 counter comment "campus-fix: normalize IPv6 DSCP to CS0"
+}
+
+# --------------------------------------------------------- QUIC block
+# Mechanism: QUIC (UDP/443) encrypts everything including SNI, so HTTP-level
+# UA consistency tools on client browsers cannot be enforced, and campus DPI
+# sees protocol diversity (TCP+UDP 443 mix) that single-host profiles usually
+# lack. Blocking outbound QUIC forces browsers to fall back to TCP/TLS 1.3.
+# Individual clients can then be normalized at the UA level.
+chain campus_quic_block {
+	type filter hook forward priority filter - 5; policy accept;
+	oifname != "lo" udp dport 443 ct state new counter drop comment "campus-fix: block QUIC/HTTP3, force TCP TLS"
 }

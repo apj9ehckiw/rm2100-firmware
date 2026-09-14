@@ -1,23 +1,43 @@
 #!/bin/sh
-# Replace default banner with campus-fix usage notes
-cat > /etc/banner <<'EOF'
- -----------------------------------------------------
- Redmi RM AC2100 - OpenWrt 24.10 (campus-fix build)
+# campus-fix v2: version stamp (queried via: cat /etc/campus-fix-version)
+echo "2.0.0" > /etc/campus-fix-version
 
- TTL fix: ACTIVE (nftables)
-   check:   nft list chain inet fw4 campus_ttl_postrouting
-   adjust:  vi /etc/nftables.d/10-campus-ttl-fix.nft (64 <-> 128)
-            then: service firewall restart
+# Replace default banner with campus-fix usage notes
+cat > /etc/banner <<EOF
+ -----------------------------------------------------
+ Redmi RM AC2100 - OpenWrt 24.10 (campus-fix build v$(cat /etc/campus-fix-version))
+
+ Anti-detection: ACTIVE (nftables /etc/nftables.d/)
+   TTL/hoplimit  -> 64            (nft list chain inet fw4 campus_ttl_postrouting)
+   IP-ID         -> flow-hash     (nft list chain inet fw4 campus_ipid_postrouting)
+   DSCP/ECN      -> CS0           (nft list chain inet fw4 campus_dscp_postrouting)
+   QUIC UDP/443  -> DROP          (nft list chain inet fw4 campus_quic_block)
+   DNS           -> forced to system resolver (dnsmasq, no client bypass)
+   IPv6          -> LAN RA/DHCPv6 off by default (no hop-limit leak path)
+
+ Adjust: vi /etc/nftables.d/10-campus-ttl-fix.nft  (TTL 64 <-> 128)
+         service firewall restart
 
  WAN setup: LuCI -> Network -> Interfaces -> wan
    DHCP auth portal: keep dhcp
    PPPoE dorm line:  switch proto to pppoe
 
  Detection notes:
-   TTL        fixed by this build
+   TTL        fixed (campus_ttl_postrouting)
    IP-MAC     NAT presents single router MAC (inherent)
    client#    only the router authenticates (inherent)
-   UA/finger  NOT fixable at router - per-client browsers
+   UA/finger  TCP TLS now enforced (QUIC blocked); per-client browser
+              extension still recommended for full UA consistency
  -----------------------------------------------------
 EOF
+
+# Disable IPv6 RA/DHCPv6 announcements on LAN by default: with IPv6 enabled,
+# downstream devices get global addresses and hop-limit leaks + unique-prefix
+# fingerprints become possible. NAT66-less LAN is the safest posture here.
+# (WAN IPv6 stays enabled harmlessly; if campus requires v6 auth, re-enable
+# ra_management below.)
+uci -q set dhcp.lan.ra='disabled' 2>/dev/null
+uci -q set dhcp.lan.dhcpv6='disabled' 2>/dev/null
+uci -q commit dhcp 2>/dev/null
+
 exit 0

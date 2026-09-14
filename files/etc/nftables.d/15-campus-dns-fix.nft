@@ -1,0 +1,20 @@
+#!/bin/sh
+# campus-fix v2: force all LAN DNS through the router's dnsmasq.
+#
+# Mechanism: campus DNS-based detectors compare resolver traffic. Devices
+# configured with hardcoded public DNS (8.8.8.8 etc) generate plaintext DNS
+# to third-party resolvers straight through the router - distinguishable
+# from single-host behavior and also bypasses the campus portal. Forcing
+# everything to dnsmasq (which then uses the campus resolver) keeps the
+# traffic profile uniform.
+#
+# Method: nat PREROUTING redirect of UDP/TCP 53 from LAN to router.
+# (DoH is not blocked here - it shares port 443 with normal TLS; blocking
+# it wholesale breaks too much. QUIC is already blocked by 10-campus-ttl-fix,
+# so DoH-over-HTTP/3 is impossible; DoH-over-TCP will need client policy.)
+
+chain campus_dns_redirect {
+	type nat hook prerouting priority dstnat + 5; policy accept;
+	iifname "br-lan" udp dport 53 counter redirect to :53 comment "campus-fix: force LAN DNS to router"
+	iifname "br-lan" tcp dport 53 counter redirect to :53 comment "campus-fix: force LAN DNS to router"
+}
