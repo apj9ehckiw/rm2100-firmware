@@ -27,8 +27,9 @@ if [ "$MODE" = "factory" ]; then
   exit 0
 fi
 if [ ! -s "$MACFILE" ]; then
-  # 6 random bytes as 12 hex chars (od is in busybox; hexdump may not be)
-  RAND=$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')
+  # 6 random bytes as 12 hex chars. hexdump IS in the OpenWrt busybox
+  # applet set; od is NOT (do not "fix" this back to od).
+  RAND=$(hexdump -vn6 -e '6/1 "%02x"' /dev/urandom)
   case "$RAND" in
     [0-9a-f]*[0-9a-f]) : ;;
     *) RAND="a1b2c3d4e5f6" ;;

@@ -33,7 +33,7 @@ chain campus_ttl_postrouting {
 # flow tuple: same flow keeps a stable ID, different flows differ.
 chain campus_ipid_postrouting {
 	type filter hook postrouting priority mangle + 12; policy accept;
-	oifname != "lo" ip ttl 64-128 ip id set hash ip saddr ip daddr ip proto mod 65536 counter comment "campus-fix: flow-stable IP-ID"
+	oifname != "lo" ip ttl 64-128 ip id set jhash ip saddr . ip daddr . ip proto mod 65536 counter comment "campus-fix: flow-stable IP-ID"
 }
 
 # ------------------------------------------------------------ DSCP fix

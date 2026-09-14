@@ -17,7 +17,11 @@ uci -q set network.wan.hostname='DESKTOP-CAMPUS'
 uci -q set network.wan.clientid=''          # drop stale client-id if any
 uci -q commit network
 
-# 2) dnsmasq: minimize leaked option detail toward LAN clients
+# 2) dnsmasq: tag LAN replies with a vanilla Windows vendor-class. This only
+# shapes what the ROUTER sends on the LAN side (campus sniffers are on the
+# WAN side and never see these); it exists so a sniffer inside the LAN
+# segment (e.g. a roommate's box in promiscuous mode) sees uniform DHCP
+# replies instead of dnsmasq defaults. It does NOT touch client DISCOVERs.
 uci -q add_list dhcp.lan.dhcp_option='option:vendor-class,"MSFT 5.0"'
 uci -q commit dhcp
 

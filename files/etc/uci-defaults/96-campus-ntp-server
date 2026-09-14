@@ -6,7 +6,8 @@
 
 uci -q set system.ntp.enable='1'
 uci -q set system.ntp.enable_server='1'
-uci -q add_list system.ntp.interface='lan'
+# sysntpd validates 'interface' as a plain string option, not a list
+uci -q set system.ntp.interface='lan'
 uci -q commit system
 
 exit 0

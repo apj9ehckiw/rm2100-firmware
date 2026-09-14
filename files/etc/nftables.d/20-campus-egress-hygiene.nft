@@ -29,20 +29,21 @@ chain campus_leak_block {
 	# IGMP egress: reveals multiple IPTV/multicast receivers. ENABLE ONLY IF
 	# you do NOT use campus IPTV - this breaks IPTV.
 	# oifname != "lo" ip protocol igmp counter drop comment "campus-fix: block IGMP egress"
-
-	# Per-LAN-host concurrent connection cap (default 300) - stops one IP
-	# looking like an office building. Commented out by default; enable if
-	# the campus runs flow-count statistics and you see throttling.
-	# NOTE: requires the set below (also commented) to be uncommented.
-	# set campus_flowtab4 {
-	# 	type ipv4_addr
-	# 	flags dynamic
-	# }
-	# chain campus_flowcap {
-	# 	type filter hook forward priority filter - 7; policy accept;
-	# 	oifname != "lo" update @campus_flowtab4 { ip saddr ct count over 300 } counter drop comment "campus-fix: per-host flow cap"
-	# }
 }
+
+# Per-LAN-host concurrent connection cap (default 300) - stops one IP
+# looking like an office building. Commented out by default; enable if
+# the campus runs flow-count statistics and you see throttling.
+# NOTE: uncomment BOTH the set and the chain below together. They are at
+# table scope (outside any chain) - that is why they sit down here.
+# set campus_flowtab4 {
+# 	type ipv4_addr
+# 	flags dynamic
+# }
+# chain campus_flowcap {
+# 	type filter hook forward priority filter - 7; policy accept;
+# 	oifname != "lo" update @campus_flowtab4 { ip saddr ct count over 300 } counter drop comment "campus-fix: per-host flow cap"
+# }
 
 # NTP: force LAN clients onto the router's own ntpd (see uci-defaults
 # 96-campus-ntp-server). Kills per-device NTP fingerprinting.

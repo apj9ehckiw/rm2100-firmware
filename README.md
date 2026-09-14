@@ -3,7 +3,7 @@
 红米 RM AC2100（MediaTek MT7621A，128MB RAM / 16MB flash）专用 OpenWrt 固件，
 内置**校园网多设备检测规避**套件，通过 GitHub Actions 云端构建，本机无需 Linux 环境。
 
-**当前固件版本：v2.2.0**（刷入后 `cat /etc/campus-fix-version` 查询）
+**当前固件版本：v2.3.0**（刷入后 `cat /etc/campus-fix-version` 查询）
 
 ## 功能总览
 
@@ -39,7 +39,7 @@
 - **查看**：显示 WAN 口实际生效的 MAC（实时读网卡）
 - **手动设置**：填任意合法 MAC。典型用法是**克隆你电脑网卡的 MAC**——
   校园网把认证绑到电脑 MAC 时，克隆后路由器无缝顶替，无需重新注册
-- **Rotate**：一键换新随机 MAC（本地管理位自动处理）
+- **Rotate**：一键生成新随机 MAC（本地管理位自动处理），生成后填入框内，点 **Save & Apply** 持久化
 - **Reset / 留空保存**：恢复出厂 WAN MAC
 - 改完 `ifup wan` 或重启生效；**除克隆场景外，改 MAC 后要在校园网认证页
   重新登录**（认证会话绑定 MAC）
@@ -55,7 +55,7 @@
 ## 使用方法
 
 1. **构建**：本仓库已配好 Actions。进 **Actions → Build RM AC2100 OpenWrt
-   firmware → Run workflow**，默认参数（24.10.2 + LuCI + v2.2.0）直接 Run，
+   firmware → Run workflow**，默认参数（24.10.2 + LuCI + v2.3.0）直接 Run，
    约 3-5 分钟出包。可调输入：
    - `openwrt_version`：OpenWrt 底包版本
    - `include_luci`：是否带 LuCI（false = 纯 CLI，省内存）
@@ -83,12 +83,12 @@
 
 5. **上网**：LuCI → Network → Interfaces → wan。DHCP 认证门户保持 dhcp；
    宿舍 PPPoE 拨号就切 pppoe。网线插面板丝印 WAN 口
-   （OpenWrt 映射：WAN=`eth0.2`，LAN1-3=`eth0.1`）。
+   （OpenWrt 24.10 DSA 映射：WAN 口设备名 `wan`，LAN1-3 为 `lan1`-`lan3`；基接口同为 `eth0`，`ip link` 可见 `eth0` 上的 VLAN 子接口）。
 
 ## 首次进系统检查清单
 
 ```
-cat /etc/campus-fix-version        # 应显示 2.2.0
+cat /etc/campus-fix-version        # 应显示 2.3.0
 nft list chain inet fw4 campus_ttl_postrouting     # counter 在涨 = TTL 归一生效
 nft list chain inet fw4 campus_quic_block          # drop 在涨 = 有客户端试图 QUIC
 nft list chain inet fw4 campus_leak_block          # 发现协议封锁生效
@@ -151,3 +151,4 @@ files/
 | v2.0.0 | + IP-ID flow-hash、DSCP 归一、QUIC 封锁、DNS 重定向、DHCP 指纹、LAN IPv6 关闭；版本戳进固件 |
 | v2.1.0 | + DoT/发现协议/ICMP-ts 封锁、NTP 重定向、WAN MAC 随机化、栈参数；IGMP/流数上限可选开关 |
 | v2.2.0 | + LuCI「Campus MAC」页面（查/设/克隆/轮换/复原），MAC 三模式持久化 |
+| v2.3.0 | 修复：IP-ID 规则 `hash`→`jhash`（v2.0 起语法错误导致 fw4 整表加载失败、首刷断网）；MAC 随机化 `od`→`hexdump`（busybox 无 od，原 fallback 会让所有设备同 MAC）；Campus MAC 页面重写为 ucode 实现（24.10 luci-base 无 Lua 运行时，原 Lua CBI 页面静默失效）；NTP interface list→option；CI 增加 nft 语法校验步骤 |

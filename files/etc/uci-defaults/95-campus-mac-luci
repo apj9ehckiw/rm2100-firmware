@@ -1,5 +1,5 @@
 #!/bin/sh
-# campus-fix v2.2: WAN MAC management UI.
+# campus-fix v2.3: WAN MAC management UI (ucode LuCI page).
 #
 # The firmware already randomizes the WAN MAC on first boot
 # (97-campus-wan-hygiene, persisted in /etc/campus-fix-wanmac and applied
@@ -7,125 +7,177 @@
 # manually, so you can clone your PC's MAC or rotate on demand without ssh.
 #
 # Page: LuCI -> Network -> Campus MAC
-# Uses rpcd/luci-bwc-free plain uci calls; no extra packages needed.
+# Implemented with the ucode-based LuCI runtime shipped in OpenWrt 24.10
+# (luci-base has no Lua interpreter; Lua CBI pages require luci-compat,
+# which is NOT installed). Uses menu.d JSON + rpcd ucode backend only.
+#
+# NOTE on random bytes: OpenWrt busybox has hexdump but NOT od.
 
-cat > /usr/lib/lua/luci/controller/campus_mac.lua <<'LUAEOF'
-module("luci.controller.campus_mac", package.seeall)
+# --- 1) rpcd plugin: expose live MAC read + random MAC generation
+mkdir -p /usr/share/rpcd/ucode
+cat > /usr/share/rpcd/ucode/campusmac <<'UCEOF'
+// campus-fix rpcd backend: read live WAN MAC, generate random MAC
+'use strict';
 
-function index()
-	-- only for logged-in admins; lives under Network menu
-	entry({"admin", "network", "campus_mac"},
-		cbi("campus_mac"), _("Campus MAC"), 76).dependent = false
-end
-LUAEOF
+import { readfile, popen, pclose } from 'fs';
+import { cursor } from 'uci';
 
-mkdir -p /usr/lib/lua/luci/model/cbi
-cat > /usr/lib/lua/luci/model/cbi/campus_mac.lua <<'CBIEOF'
---[[
-	Campus MAC - view/set the WAN MAC address from LuCI
-	(campus-fix firmware)
-]]--
+const q = "'";
 
-local sys = require "luci.sys"
-local nw = require "luci.model.network"
+return {
+	livemac: {
+		call: function(request, args) {
+			// resolve the wan logical interface to its device, then read MAC
+			let uci = cursor();
+			let dev = uci.get('network', 'wan', 'device');
 
-m = Map("network", translate("Campus MAC"),
-	translate("The MAC address your router presents to the campus network. " ..
-		"A random locally-administered MAC was generated on first boot. " ..
-		"You can set it manually (e.g. clone your PC's NIC MAC) or rotate it." ..
-		"<br /><br /><b>Format:</b> 6 hex pairs separated by colons, " ..
-		"e.g. <code>12:34:56:78:9A:BC</code>. " ..
-		"Leave empty to go back to the router's factory WAN MAC." ..
-		"<br /><br /><b>Effective after</b> <code>ifup wan</code> or reboot. " ..
-		"Campus portals usually bind the auth session to the MAC - " ..
-		"after changing it, re-login on the portal."))
+			if (!dev) {
+				// DSA 'wan' or legacy eth0.2: fall back to ifstatus
+				let p = popen('ifstatus wan 2>/dev/null');
+				let out = p.read('all');
+				p.close();
 
-init = m:section(NamedSection, "wan", "interface", translate("WAN interface"))
+				if (out) {
+					let m = match(out, /"device":"([^"]+)"/);
+					if (m)
+						dev = m[1];
+				}
+			}
 
-mac = init:option(Value, "macaddr", translate("WAN MAC address"))
-mac.rmempty = true
-mac.datatype = "macaddr"
+			if (!dev)
+				return { mac: null, error: 'no wan device' };
 
-function mac.cfgvalue(self, section)
-	-- show the CURRENT live MAC, not just the uci config value
-	local ntm = nw.init()
-	local net = ntm:get_network("wan")
-	if net then
-		local dev = net:get_interface()
-		if dev then
-			local live = dev:mac()
-			return live or self.map:get(section, "macaddr")
-		end
-	end
-	return self.map:get(section, "macaddr")
-end
+			let mac = trim(readfile(`/sys/class/net/${dev}/address`) ?? '');
 
-function mac.write(self, section, value)
-	if value and #value > 0 then
-		local v = value:lower():gsub("[^0-9a-f:]", "")
-		-- normalize separators to colons
-		local clean = v:gsub("%-", ":")
-		if #clean == 17 then
-			self.map:set(section, "macaddr", clean)
-			-- persist MAC + mode so 97- boot script keeps it
-			local f = io.open("/etc/campus-fix-wanmac", "w")
-			if f then
-				f:write(clean:gsub(":", ""))
-				f:close()
-			end
-			f = io.open("/etc/campus-fix-macmode", "w")
-			if f then f:write("custom") f:close() end
-		end
-	else
-		-- empty: remove override, restore factory WAN MAC
-		self.map:del(section, "macaddr")
-		local f = io.open("/etc/campus-fix-wanmac", "w")
-		if f then f:write("") f:close() end
-		f = io.open("/etc/campus-fix-macmode", "w")
-		if f then f:write("factory") f:close() end
-	end
-end
+			return { mac: mac || null, device: dev };
+		}
+	},
 
-rotate = init:option(Button, "_rotate", translate("Rotate (new random MAC)"))
-rotate.inputtitle = translate("Generate")
-rotate.inputstyle = "apply"
+	rotate: {
+		call: function(request, args) {
+			// hexdump (NOT od - od is not in the OpenWrt busybox applet set)
+			let p = popen('hexdump -vn6 -e ' + q + '6/1 "%02x"' + q + ' /dev/urandom');
+			let out = p.read('all');
+			p.close();
 
-function rotate.write(self, section)
-	local rand = sys.exec("od -An -N6 -tx1 /dev/urandom | tr -d ' \\n'")
-	rand = rand:gsub("[^0-9a-f]", "")
-	if #rand >= 12 then
-		local b1 = tonumber(rand:sub(1, 2), 16)
-		b1 = bit.band(bit.bor(b1, 0x02), 0xFE)
-		local mac = string.format("%02x%s%s%s%s%s", b1,
-			rand:sub(3, 4), rand:sub(5, 6), rand:sub(7, 8),
-			rand:sub(9, 10), rand:sub(11, 12))
-		self.map:set(section, "macaddr", mac)
-		local f = io.open("/etc/campus-fix-wanmac", "w")
-		if f then f:write(mac:gsub(":", "")) f:close() end
-		f = io.open("/etc/campus-fix-macmode", "w")
-		if f then f:write("custom") f:close() end
-	end
-end
+			let hex = replace(out, /[^0-9a-f]/g, '');
 
-factory = init:option(Button, "_factory", translate("Reset to factory WAN MAC"))
-factory.inputtitle = translate("Reset")
-factory.inputstyle = "reset"
+			if (length(hex) < 12)
+				return { mac: null, error: 'random source failed' };
 
-function factory.write(self, section)
-	-- read the factory MAC from the board.json / device tree via ifstatus
-	local out = sys.exec("ubus call system board | jsonfilter -e '@.release.version' 2>/dev/null")
-	local mactxt = sys.exec("cat /sys/class/net/eth0/address 2>/dev/null || true")
-	-- eth0 base MAC = factory; WAN is eth0.2 (base+1 on this board, but keep
-	-- it simple: clear the override and let OpenWrt use its computed default)
-	self.map:del(section, "macaddr")
-	local f = io.open("/etc/campus-fix-wanmac", "w")
-	if f then f:write("") f:close() end
-	f = io.open("/etc/campus-fix-macmode", "w")
-	if f then f:write("factory") f:close() end
-end
+			// first byte: locally-administered unicast (bit1 set, bit0 clear)
+			let b1 = (hex2dec(substr(hex, 0, 2)) | 0x02) & 0xFE;
 
-return m
-CBIEOF
+			return { mac: sprintf('%02x%s', b1, substr(hex, 2, 10)) };
+		}
+	}
+};
+UCEOF
+
+# --- 2) ACL: allow the admin session to call the backend
+mkdir -p /usr/share/rpcd/acl.d
+cat > /usr/share/rpcd/acl.d/campusmac.json <<'JSONEOF'
+{
+	"campusmac": {
+		"description": "Campus MAC page backend access",
+		"read": {
+			"ubus": {
+				"campusmac": [ "livemac", "rotate" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"campusmac": [ "livemac", "rotate" ]
+			}
+		}
+	}
+}
+JSONEOF
+
+# --- 3) menu entry (Network menu, after Firewall)
+mkdir -p /usr/share/luci/menu.d
+cat > /usr/share/luci/menu.d/campusmac.json <<'MENUEOF'
+{
+	"admin/network/campusmac": {
+		"title": "Campus MAC",
+		"order": 76,
+		"action": {
+			"type": "view",
+			"path": "campusmac"
+		},
+		"depends": {
+			"acl": [ "campusmac" ],
+			"uci": { "network": true }
+		}
+	}
+}
+MENUEOF
+
+# --- 4) client-side view (JS, native LuCI 24.10 pattern)
+mkdir -p /www/luci-static/resources/view
+cat > /www/luci-static/resources/view/campusmac.js <<'JSEOF'
+'use strict';
+'require view';
+'require ui';
+'require rpc';
+'require form';
+
+var callLivemac = rpc.declare({
+	object: 'campusmac',
+	method: 'livemac',
+	expect: { 'mac': null, 'device': '' }
+});
+
+var callRotate = rpc.declare({
+	object: 'campusmac',
+	method: 'rotate',
+	expect: { 'mac': null }
+});
+
+return view.extend({
+	load: function() {
+		return L.resolveDefault(callLivemac(), {});
+	},
+
+	render: function(live) {
+		var m, s, o;
+
+		m = new form.Map('network', _('Campus MAC'),
+			_('The MAC address your router presents to the campus network. ') +
+			_('A random locally-administered MAC was generated on first boot.') +
+			_('<br /><br /><b>Format:</b> 6 hex pairs separated by colons, e.g. <code>12:34:56:78:9A:BC</code>. ') +
+			_('Leave empty to go back to the router\'s factory WAN MAC.') +
+			_('<br /><br /><b>Effective after</b> <code>ifup wan</code> or reboot. ') +
+			_('Campus portals usually bind the auth session to the MAC - after changing it, re-login on the portal.'));
+
+		s = m.section(form.NamedSection, 'wan', 'interface', _('WAN interface'));
+
+		o = s.option(form.Value, 'macaddr', _('WAN MAC address'),
+			_('Live MAC on the WAN device') + ': <code>' + (live ? (live.mac || _('unknown')) : _('unknown')) + '</code>');
+		o.rmempty = true;
+		o.datatype = 'macaddr';
+
+		o = s.option(form.Button, '_rotate', _('Rotate (new random MAC)'));
+		o.inputstyle = 'apply';
+		o.inputtitle = _('Generate');
+		o.onclick = function(ev) {
+			return callRotate().then(function(ret) {
+				if (ret && ret.mac) {
+					var input = document.querySelector('.cbi-value-field input[id$="macaddr"]');
+					if (input)
+						input.value = ret.mac;
+					ui.addNotification(null, _('New random MAC: <code>%s</code> - click "Save &amp; Apply" to persist.').format(ret.mac), 'info');
+				}
+				else {
+					ui.addNotification(null, _('MAC generation failed'), 'error');
+				}
+			});
+		};
+
+		return m.render();
+	}
+});
+JSEOF
 
 # reload luci caches so the page appears without manual flush
 rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* 2>/dev/null
