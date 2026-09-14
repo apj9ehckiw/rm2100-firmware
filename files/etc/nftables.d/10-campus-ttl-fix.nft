@@ -29,11 +29,13 @@ chain campus_ttl_postrouting {
 # global counter, random). Behind one router, forwarded flows from different
 # OSes produce mixed IP-ID patterns on one source IP - a strong statistical
 # signal that many cheap detectors use. Setting a per-flow random-looking but
-# consistent ID defeats this. nft has no per-flow random, so use hash of the
-# flow tuple: same flow keeps a stable ID, different flows differ.
+# consistent ID defeats this. nft has no per-flow random, so use jhash of
+# (saddr, daddr): same flow keeps a stable ID, different flows differ.
+# NOTE: jhash keys are limited to {ip saddr, ip6 daddr, tcp dport, udp sport,
+# ether saddr} concatenated with '.' - "ip proto" is NOT a valid key.
 chain campus_ipid_postrouting {
 	type filter hook postrouting priority mangle + 12; policy accept;
-	oifname != "lo" ip ttl 64-128 ip id set jhash ip saddr . ip daddr . ip proto mod 65536 counter comment "campus-fix: flow-stable IP-ID"
+	oifname != "lo" ip ttl 64-128 ip id set jhash ip saddr . ip daddr mod 65536 counter comment "campus-fix: flow-stable IP-ID"
 }
 
 # ------------------------------------------------------------ DSCP fix
