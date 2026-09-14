@@ -1,0 +1,12 @@
+#!/bin/sh
+# campus-fix v2.1: make the router answer NTP for the whole LAN.
+# Paired with the campus_ntp_redirect chain in 20-campus-egress-hygiene.nft:
+# LAN clients get redirected to this server, so no device sends its own
+# NTP fingerprint upstream.
+
+uci -q set system.ntp.enable='1'
+uci -q set system.ntp.enable_server='1'
+uci -q add_list system.ntp.interface='lan'
+uci -q commit system
+
+exit 0

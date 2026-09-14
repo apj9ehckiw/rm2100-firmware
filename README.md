@@ -3,7 +3,7 @@
 红米 RM AC2100（MediaTek MT7621A，128MB RAM / 16MB flash）专用 OpenWrt 固件，
 内置**校园网多设备检测规避**套件，通过 GitHub Actions 云端构建，本机无需 Linux 环境。
 
-当前固件版本：**v2.0.0**（`/etc/campus-fix-version`，Actions 里可用 `fw_version` 输入改）
+当前固件版本：**v2.1.0**（`/etc/campus-fix-version`，Actions 里可用 `fw_version` 输入改）
 
 ## 使用方法
 
@@ -20,6 +20,7 @@
    默认参数（24.10.2 + LuCI + fw_version 2.0.0）直接点 Run。约 3-5 分钟出包。
    升级版本时改 `fw_version` 输入（会写进固件 `/etc/campus-fix-version` 和
    artifact 名字：`rm2100-firmware-v<版本>-openwrt-<OpenWrt 版本>`）。
+   v1→v2 或 v2→v2.1 升级都**不要**保留配置。
 
 3. 在该次运行页面下载 artifact（如 `rm2100-firmware-v2.0.0-openwrt-24.10.2`），解压得到：
    - `openwrt-*-ramips-mt7621-xiaomi_redmi-router-ac2100-squashfs-kernel1.bin`
@@ -48,6 +49,22 @@
 | IP-MAC 绑定 | NAT 天然只暴露路由器 WAN 口 MAC | 无需配置 |
 | 在线客户端数 | 只有路由器本身参与认证 | 无需配置 |
 | UA/系统指纹 | QUIC 已封（UDP/443 DROP），TCP TLS 下可用终端浏览器扩展做 UA 一致化；路由器层无法强制改写 HTTPS 内的 UA | 终端侧 |
+
+### v2.1.0 新增
+
+| 检测手段 | 对策 | 位置 |
+|---|---|---|
+| DoT 逃逸（853） | DROP——否则加密 DNS 绕过 53 端口重定向 | `20-campus-egress-hygiene.nft` `campus_leak_block` |
+| 网络发现泄漏 | NetBIOS(137-139)/SMB(445)/SSDP(1900)/WS-Disc(3702)/mDNS(5353)/LLMNR(5355) 出方向 DROP——多设备广播是字面意义上的"自白"；桥接 WAN 模式下也安全 | 同上 |
+| ICMP 时间戳 | type 13/14 DROP——Windows 默认应答，泄漏 OS + 开机时长 | 同上 |
+| NTP 指纹 | LAN 全部 123 重定向到路由器自身 ntpd（`96-campus-ntp-server`），消除每设备 NTP 指纹 | `campus_ntp_redirect` |
+| WAN MAC OUI | 首次开机生成持久化的本地管理 MAC，去掉小米 OUI 与"一台 Windows 主机"人设的矛盾 | `97-campus-wan-hygiene` |
+| 栈指纹 | tcp_timestamps/window_scaling 保持开启（关了反而是新异常）、rp_filter 开 | 同上 |
+
+**默认注释掉、需要时再开**（在 `20-campus-egress-hygiene.nft` 里取消注释）：
+- **IGMP 出方向 DROP**：多播成员关系报告暴露多接收者。只在不用校园 IPTV 时开。
+- **每主机并发连接数上限**（默认 300，dynamic set 实现）：对抗流数统计。
+  开启方式：取消注释 `campus_flowtab4` set 和 `campus_flowcap` chain 两个块。
 
 **已启用/未启用的取舍**：
 - IP-ID 用 flow-hash 而非固定值：固定值会破坏分片重组且本身是异常特征。

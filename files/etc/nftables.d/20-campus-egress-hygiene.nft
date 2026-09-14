@@ -1,0 +1,52 @@
+# campus-fix v2.1: egress hygiene + protocol-escape blocking (fw4 nftables drop-in)
+#
+# Closes the leak channels the v2 rules don't cover:
+#   - DoT (853): v2 redirects port 53, but DNS-over-TLS would bypass it
+#   - Windows discovery (NetBIOS/SMB/SSDP/LLMNR/WS-Disc): forwarded discovery
+#     traffic is a literal multi-host confession; also makes bridged-WAN modes safe
+#   - ICMP timestamp (13/14): Windows answers by default -> OS + boot-time leak
+#
+# Known trade-off: SMB clients connecting OUT to campus file servers will
+# break. If you actually use campus SMB shares, delete the tcp dport 445
+# line below (LAN-to-LAN inside NAT is unaffected).
+
+chain campus_leak_block {
+	type filter hook forward priority filter - 6; policy accept;
+
+	# DNS-over-TLS bypass
+	oifname != "lo" tcp dport 853 counter drop comment "campus-fix: block DoT"
+	oifname != "lo" udp dport 853 counter drop comment "campus-fix: block DoT"
+
+	# Windows network discovery / SMB egress
+	oifname != "lo" tcp dport { 137, 139, 445 } counter drop comment "campus-fix: block NetBIOS/SMB egress"
+	oifname != "lo" udp dport { 137, 138, 139 } counter drop comment "campus-fix: block NetBIOS egress"
+	oifname != "lo" udp dport { 1900, 3702, 5353, 5355 } counter drop comment "campus-fix: block SSDP/WS-Disc/mDNS/LLMNR egress"
+
+	# ICMP timestamp request/reply (Windows answers by default)
+	oifname != "lo" icmp type { 13, 14 } counter drop comment "campus-fix: block ICMP timestamp"
+
+	# --- optional (uncomment to enable) ----------------------------------
+	# IGMP egress: reveals multiple IPTV/multicast receivers. ENABLE ONLY IF
+	# you do NOT use campus IPTV - this breaks IPTV.
+	# oifname != "lo" ip protocol igmp counter drop comment "campus-fix: block IGMP egress"
+
+	# Per-LAN-host concurrent connection cap (default 300) - stops one IP
+	# looking like an office building. Commented out by default; enable if
+	# the campus runs flow-count statistics and you see throttling.
+	# NOTE: requires the set below (also commented) to be uncommented.
+	# set campus_flowtab4 {
+	# 	type ipv4_addr
+	# 	flags dynamic
+	# }
+	# chain campus_flowcap {
+	# 	type filter hook forward priority filter - 7; policy accept;
+	# 	oifname != "lo" update @campus_flowtab4 { ip saddr ct count over 300 } counter drop comment "campus-fix: per-host flow cap"
+	# }
+}
+
+# NTP: force LAN clients onto the router's own ntpd (see uci-defaults
+# 96-campus-ntp-server). Kills per-device NTP fingerprinting.
+chain campus_ntp_redirect {
+	type nat hook prerouting priority dstnat + 6; policy accept;
+	iifname "br-lan" udp dport 123 counter redirect to :123 comment "campus-fix: force LAN NTP to router"
+}

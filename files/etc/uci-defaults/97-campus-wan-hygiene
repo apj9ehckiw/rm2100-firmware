@@ -1,0 +1,35 @@
+#!/bin/sh
+# campus-fix v2.1: WAN-side passive fingerprint hygiene.
+#
+# 1) ip-sysctl: silence the stack-tell behaviors that passive OS classifiers
+#    (p0f-style) look for on the single "host" the campus sees.
+# 2) WAN MAC locally administered: the stock Xiaomi OUI on a "Windows PC"
+#    hostname is itself an anomaly signal.
+
+# --- TCP/IP stack hygiene (applies to forwarded + router-origin traffic)
+sysctl -qw net.ipv4.tcp_timestamps=1
+sysctl -qw net.ipv4.tcp_window_scaling=1
+sysctl -qw net.ipv4.icmp_echo_ignore_broadcasts=1
+sysctl -qw net.ipv4.conf.all.rp_filter=1
+
+# --- WAN MAC: locally-administered, keeps OUI from screaming "Xiaomi router"
+# Deterministic per-install: generated once, persisted, survives reboots.
+MACFILE="/etc/campus-fix-wanmac"
+if [ ! -s "$MACFILE" ]; then
+  # 6 random bytes as 12 hex chars (od is in busybox; hexdump may not be)
+  RAND=$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')
+  case "$RAND" in
+    [0-9a-f]*[0-9a-f]) : ;;
+    *) RAND="a1b2c3d4e5f6" ;;
+  esac
+  # first byte: force locally-administered unicast (bit1 set, bit0 clear)
+  B1=$(printf '%02x' $(( (0x$(printf '%s' "$RAND" | cut -c1-2) | 0x02) & 0xFE )))
+  echo "${B1}$(printf '%s' "$RAND" | cut -c3-12)" > "$MACFILE"
+fi
+CMAC=$(sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1:\2:\3:\4:\5:\6/' "$MACFILE")
+if [ -n "$CMAC" ]; then
+  uci -q set network.wan.macaddr="$CMAC"
+  uci -q commit network
+fi
+
+exit 0
