@@ -3,13 +3,13 @@
 红米 RM AC2100（MediaTek MT7621A，128MB RAM / 16MB flash）专用 OpenWrt 固件，
 内置**校园网多设备检测规避**套件，通过 GitHub Actions 云端构建，本机无需 Linux 环境。
 
-**当前固件版本：v2.3.0**（刷入后 `cat /etc/campus-fix-version` 查询）
+**当前固件版本：v2.3.1**（刷入后 `cat /etc/campus-fix-version` 查询）
 
 ## 功能总览
 
 | 检测手段 | 对策 | 位置 / 操作 |
 |---|---|---|
-| TTL 检测 | WAN 出方向 IPv4 TTL / IPv6 hoplimit 强制 64（可改 128） | `10-campus-ttl-fix.nft` `campus_ttl_postrouting` |
+| TTL 检测 | WAN 出方向 IPv4 TTL / IPv6 hoplimit 强制 128（Windows 指纹；可改 64） | `10-campus-ttl-fix.nft` `campus_ttl_postrouting` |
 | IP-ID 熵检测 | 每 flow 稳定 IP-ID（五元组 hash），消除多 OS 混合指纹 | 同文件 `campus_ipid_postrouting` |
 | DSCP/QoS 相关性 | 出方向 DSCP 归一 CS0（ECN 保留） | 同文件 `campus_dscp_postrouting` |
 | QUIC/HTTP3 逃逸 | 转发层 DROP UDP/443，强制 TCP TLS | 同文件 `campus_quic_block` |
@@ -55,7 +55,7 @@
 ## 使用方法
 
 1. **构建**：本仓库已配好 Actions。进 **Actions → Build RM AC2100 OpenWrt
-   firmware → Run workflow**，默认参数（24.10.2 + LuCI + v2.3.0）直接 Run，
+   firmware → Run workflow**，默认参数（24.10.2 + LuCI + v2.3.1）直接 Run，
    约 3-5 分钟出包。可调输入：
    - `openwrt_version`：OpenWrt 底包版本
    - `include_luci`：是否带 LuCI（false = 纯 CLI，省内存）
@@ -88,7 +88,7 @@
 ## 首次进系统检查清单
 
 ```
-cat /etc/campus-fix-version        # 应显示 2.3.0
+cat /etc/campus-fix-version        # 应显示 2.3.1
 nft list chain inet fw4 campus_ttl_postrouting     # counter 在涨 = TTL 归一生效
 nft list chain inet fw4 campus_quic_block          # drop 在涨 = 有客户端试图 QUIC
 nft list chain inet fw4 campus_leak_block          # 发现协议封锁生效
@@ -97,9 +97,9 @@ cat /etc/campus-fix-wanmac         # 首刷生成的 WAN MAC（LuCI Campus MAC �
 
 ## 调整与维护
 
-- **TTL 基准改 128**（校园网按 Windows 指纹判定时）：LuCI → System → TTYD
+- **TTL 基准改 64**（校园网按 Linux/Mac/Android 指纹判定时）：LuCI → System → TTYD
   终端或 ssh，改 `/etc/nftables.d/10-campus-ttl-fix.nft` 里
-  `campus_ttl_postrouting` 两处 `64` → `128`（`campus_ipid_postrouting` 的
+  `campus_ttl_postrouting` 两处 `128` → `64`（`campus_ipid_postrouting` 的
   `ip ttl 64-128` 匹配域不用动），`service firewall restart`
 - **改规则后重建固件**：改 `files/` 下对应文件，commit + push，重新 Run
   workflow（workflow 里 `PACKAGES` 追加了 `kmod-ipt-nat ip6tables-nft
@@ -152,3 +152,4 @@ files/
 | v2.1.0 | + DoT/发现协议/ICMP-ts 封锁、NTP 重定向、WAN MAC 随机化、栈参数；IGMP/流数上限可选开关 |
 | v2.2.0 | + LuCI「Campus MAC」页面（查/设/克隆/轮换/复原），MAC 三模式持久化 |
 | v2.3.0 | 修复：IP-ID 规则 `hash`→`jhash`（v2.0 起语法错误导致 fw4 整表加载失败、首刷断网）；MAC 随机化 `od`→`hexdump`（busybox 无 od，原 fallback 会让所有设备同 MAC）；Campus MAC 页面重写为 ucode 实现（24.10 luci-base 无 Lua 运行时，原 Lua CBI 页面静默失效）；NTP interface list→option；CI 增加 nft 语法校验步骤 |
+| v2.3.1 | TTL/hoplimit 默认基准 64 → 128（Windows 指纹；校园认证通常面向 PC，128 亦是更保守的默认） |

@@ -16,12 +16,14 @@
 # Mechanism: a direct host emits Windows=128 / Linux-Mac-Android=64. Forwarded
 # traffic shows TTL-1. Normalizing every WAN-bound packet to one value makes
 # the router invisible to hop-count probes.
-# Default 64 = Linux/Mac/Android fingerprint. If the campus expects Windows
-# hosts, change to 128 (both rules) and `service firewall restart`.
+# Default 128 = Windows fingerprint (campus portals usually expect PCs; a
+# Windows TTL is also the safer default since detectors flag low TTLs as
+# router-forwarded). If your campus baseline is Linux/Mac/Android, change
+# both rules to 64 and `service firewall restart`.
 chain campus_ttl_postrouting {
 	type filter hook postrouting priority mangle + 10; policy accept;
-	oifname != "lo" ip ttl set 64 counter comment "campus-fix: normalize IPv4 TTL"
-	oifname != "lo" ip6 hoplimit set 64 counter comment "campus-fix: normalize IPv6 hoplimit"
+	oifname != "lo" ip ttl set 128 counter comment "campus-fix: normalize IPv4 TTL"
+	oifname != "lo" ip6 hoplimit set 128 counter comment "campus-fix: normalize IPv6 hoplimit"
 }
 
 # ------------------------------------------------------------- IP-ID fix

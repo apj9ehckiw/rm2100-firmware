@@ -1,6 +1,6 @@
 #!/bin/sh
 # campus-fix v2.3: version stamp (queried via: cat /etc/campus-fix-version)
-echo "2.3.0" > /etc/campus-fix-version
+echo "2.3.1" > /etc/campus-fix-version
 
 # Replace default banner with campus-fix usage notes
 cat > /etc/banner <<EOF
@@ -8,7 +8,7 @@ cat > /etc/banner <<EOF
  Redmi RM AC2100 - OpenWrt 24.10 (campus-fix build v$(cat /etc/campus-fix-version))
 
  Anti-detection: ACTIVE (nftables /etc/nftables.d/)
-   TTL/hoplimit  -> 64            (nft list chain inet fw4 campus_ttl_postrouting)
+   TTL/hoplimit  -> 128           (nft list chain inet fw4 campus_ttl_postrouting)
    IP-ID         -> flow-hash     (nft list chain inet fw4 campus_ipid_postrouting)
    DSCP/ECN      -> CS0           (nft list chain inet fw4 campus_dscp_postrouting)
    QUIC UDP/443  -> DROP          (nft list chain inet fw4 campus_quic_block)
