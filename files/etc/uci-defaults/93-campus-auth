@@ -107,13 +107,27 @@ fetch() {
 # probe the hijack gateway to learn our session params:
 # any http:// request returns a JS redirect containing the full portal URL.
 # We use the status API afterwards to get the authoritative portalForm.
+# Returns the portal.do URL on stdout (params included), or empty on no
+# hijack. Sets PROBE_HTTP to 1 when 10.0.0.1 answered at all (distinguishes
+# "answered but no hijack" from "unreachable").
+PROBE_HTTP=0
 probe_params() {
 	local body redirect
-	body=$(fetch "http://10.0.0.1/") || return 1
+	body=$(fetch "http://10.0.0.1/") || body=""
+	[ -n "$body" ] && PROBE_HTTP=1
 	redirect=$(echo "$body" | grep -o 'http://[^"]*portal\.do[^"]*' | head -1)
 	[ -n "$redirect" ] || return 1
 	# extract params from the portal.do URL
 	echo "$redirect"
+}
+
+# internet reachability check (ICMP to a public anycast DNS; IP literal so
+# DNS hijacking cannot fake it). Campus networks answer hijack-portal DNS
+# even when unauthenticated, so ICMP is the trustworthy signal here.
+check_online() {
+	ping -c 1 -W 3 223.5.5.5 >/dev/null 2>&1 && return 0
+	ping -c 1 -W 3 119.29.29.29 >/dev/null 2>&1 && return 0
+	return 1
 }
 
 # GET PortalJsonAction.do and echo raw JSON
@@ -149,16 +163,28 @@ while true; do
 
 	# --- gather session params ----------------------------------------
 	# The hijack gateway only answers with a portal.do redirect while the
-	# session is UNAUTHENTICATED. Once online, 10.0.0.1 stops hijacking
-	# (or does not respond), which itself is a reliable "still online"
-	# signal - and avoids hammering quickauth every cycle (constant
-	# re-auth attempts are a behavioral anomaly the campus could flag).
+	# session is UNAUTHENTICATED. Once online (e.g. MAC-based silent auth:
+	# same WAN MAC as last session), 10.0.0.1 stops hijacking - which itself
+	# is a "no auth needed" signal. Verify with an internet reachability
+	# probe before declaring anything, so a silently-authenticated router
+	# (fresh boot, AUTH_OK still 0) is not misreported as "probe-failed".
 	REDIRECT=$(probe_params)
 	if [ -z "$REDIRECT" ]; then
 		if [ "$AUTH_OK" = "1" ]; then
 			set_status "online(no-hijack) $(date '+%Y-%m-%d %H:%M:%S')"
+		elif check_online; then
+			# hijack gone AND internet reachable: silently authenticated
+			# (MAC auth) or otherwise exempted - nothing to do
+			AUTH_OK=1; ONLINE_STAMP=$(date +%s)
+			set_status "online(mac-auth/免认证) $(date '+%Y-%m-%d %H:%M:%S')"
+			log "no hijack but internet reachable - already authenticated (mac-auth?)"
+		elif [ "$PROBE_HTTP" = "1" ]; then
+			# gateway answered but no portal.do redirect and no internet:
+			# portal moved or hijack format changed - worth a log line
+			set_status "probe-failed（网关应答但无劫持跳转且外网不通） $(date '+%Y-%m-%d %H:%M:%S')"
+			log "gateway answered without portal.do redirect; internet unreachable"
 		else
-			set_status "probe-failed $(date '+%Y-%m-%d %H:%M:%S')"
+			set_status "offline（网关不可达，外网不通） $(date '+%Y-%m-%d %H:%M:%S')"
 			log "hijack gateway probe failed (gateway down or portal moved)"
 		fi
 		sleep "$INTERVAL"
