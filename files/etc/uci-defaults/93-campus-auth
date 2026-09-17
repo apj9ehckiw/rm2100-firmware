@@ -126,19 +126,24 @@ probe_params() {
 
 # internet reachability check. A plain ICMP probe is NOT enough: this campus
 # force-disconnects users on weeknights (23:30+) while leaving ICMP to public
-# DNS reachable - ping says "online" while HTTP is dead. Probe the HTTP layer
-# instead via generate_204 endpoints (two fallback probes, both China-side):
-#   - real online       -> HTTP 204, empty body, exit 0
-#   - unauthenticated   -> hijacked to the portal page (body has portal.do)
-#   - force-disconnected-> connect timeout/failure, non-zero exit
+# IPs reachable - ping 223.5.5.5 answers while HTTP and DNS are both dead
+# (ping qq.com / baidu.com fails: name resolution dies with the network).
+# Probe the HTTP layer via generate_204 endpoints instead:
+#   - real online        -> HTTP 204, empty body, exit 0
+#   - unauthenticated    -> hijacked to the portal page (body has portal.do)
+#   - force-disconnected -> DNS/connect failure, non-zero exit
 # Globals (same subshell caveat as probe_params):
 #   NET_HIJACK  1 when the response looked like the portal hijack page
+#   NET_ICMP    1 when ICMP to a public IP still answers (diagnostic only)
 NET_HIJACK=0
+NET_ICMP=0
 check_online() {
-	NET_HIJACK=0
+	NET_HIJACK=0; NET_ICMP=0
 	local body rc
-	for url in "http://204.ustclug.org/generate_204" \
-	           "http://connect.rom.miui.com/generate_204"; do
+	# miui first: China-mobile IP, direct domestic route. ustclug sits
+	# behind Cloudflare, which campus networks rate-limit at peak hours.
+	for url in "http://connect.rom.miui.com/generate_204" \
+	           "http://204.ustclug.org/generate_204"; do
 		body=$(uclient-fetch -q -T 8 --user-agent "$UA" -O - "$url" 2>/dev/null)
 		rc=$?
 		if [ $rc -eq 0 ]; then
@@ -152,9 +157,14 @@ check_online() {
 			fi
 			return 0
 		fi
-		# rc!=0: connection-level failure (4) or non-2xx (8). Both can also
-		# mean "this single endpoint is down" - try the next probe.
+		# rc!=0: DNS resolution failure, connection-level failure (4) or
+		# non-2xx (8). Could also be "this single endpoint is down" or
+		# "DNS flaky while online" - try the next probe before giving up.
 	done
+	# both HTTP probes dead. ICMP as a diagnostic ONLY (never as the online
+	# signal): distinguishes the force-disconnect window (ICMP alive, HTTP+
+	# DNS dead) from a total outage (cable pulled, gateway down).
+	ping -c 1 -W 3 223.5.5.5 >/dev/null 2>&1 && NET_ICMP=1
 	return 1
 }
 
@@ -219,13 +229,26 @@ while true; do
 			# from 10.0.0.1 - the AC is mid-transition; retry next cycle
 			set_status "portal-transition（检测到劫持页，等待下轮探测） $(date '+%Y-%m-%d %H:%M:%S')"
 		elif [ "$AUTH_OK" = "1" ]; then
-			# was online, HTTP layer now dead while ICMP may still answer:
-			# weeknight force-disconnect (23:30+) looks exactly like this.
-			# Reset AUTH_OK so we re-run the full auth path the moment the
-			# AC starts hijacking again (i.e. network is back).
+			# was online, HTTP layer now dead. Distinguish by NET_ICMP:
+			#  - ICMP alive (223.5.5.5 answers, qq.com no longer resolves):
+			#    the weeknight force-disconnect window (23:30+). AC keeps
+			#    ICMP but kills HTTP+DNS.
+			#  - ICMP dead too: total outage.
+			# Either way reset AUTH_OK so the full auth path re-runs the
+			# moment the AC starts hijacking again (network is back).
 			AUTH_OK=0
-			set_status "disconnected（HTTP 不通，疑似停机断网；恢复后自动重连） $(date '+%Y-%m-%d %H:%M:%S')"
-			log "online->disconnected: HTTP layer unreachable (force-disconnect window?)"
+			if [ "$NET_ICMP" = "1" ]; then
+				set_status "disconnected（HTTP/DNS 已断（疑似停机），ICMP 仍通；恢复后自动重连） $(date '+%Y-%m-%d %H:%M:%S')"
+			else
+				set_status "disconnected（外网完全不可达；恢复后自动重连） $(date '+%Y-%m-%d %H:%M:%S')"
+			fi
+			log "online->disconnected: HTTP probes dead (icmp=$NET_ICMP; force-disconnect window?)"
+		elif [ "$NET_ICMP" = "1" ]; then
+			# never authenticated this session and HTTP is dead while ICMP
+			# answers: force-disconnect window (or DNS outage) - not an
+			# auth problem. Nothing to try until the network returns.
+			set_status "disconnected（HTTP/DNS 已断（疑似停机），ICMP 仍通） $(date '+%Y-%m-%d %H:%M:%S')"
+			log "HTTP dead, ICMP alive (force-disconnect window?); not an auth issue"
 		elif [ "$PROBE_HTTP" = "1" ]; then
 			# gateway answered but no portal.do redirect and no internet:
 			# portal moved or hijack format changed - worth a log line
