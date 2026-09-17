@@ -3,8 +3,8 @@
 #
 # View and SET the WAN MAC manually - clone your PC's MAC or rotate on
 # demand without ssh. The factory MAC is kept by default (no first-boot
-# randomization since v2.6); any custom MAC set here is persisted in
-# /etc/campus-fix-wanmac and re-applied by 97-campus-wan-hygiene on boot.
+# randomization since v2.6); a custom MAC set here is saved directly to
+# uci (network.wan.macaddr) and re-applied by netifd on every ifup.
 #
 # Page: LuCI -> Network -> Campus MAC (校园网 MAC)
 # Implemented with the ucode-based LuCI runtime shipped in OpenWrt 24.10

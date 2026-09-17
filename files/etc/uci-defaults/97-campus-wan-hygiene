@@ -7,7 +7,8 @@
 #    random locally-administered MAC on first boot; changed by user request -
 #    a stable MAC avoids portal re-auth, and campus auth binds to it anyway).
 #    The factory Xiaomi OUI is a weak signal; if the campus flags it, use the
-#    LuCI "校园网 MAC" page to clone a PC MAC or rotate.
+#    LuCI "校园网 MAC" page to clone a PC MAC or rotate (custom MACs persist
+#    directly in uci - network.wan.macaddr; nothing else to replay at boot).
 
 # --- TCP/IP stack hygiene (applies to forwarded + router-origin traffic)
 sysctl -qw net.ipv4.tcp_timestamps=1
@@ -15,25 +16,8 @@ sysctl -qw net.ipv4.tcp_window_scaling=1
 sysctl -qw net.ipv4.icmp_echo_ignore_broadcasts=1
 sysctl -qw net.ipv4.conf.all.rp_filter=1
 
-# --- WAN MAC: factory default, no first-boot randomization anymore.
-# Mode file is kept for the LuCI page (custom/factory), but on a fresh flash
-# we deliberately do nothing - OpenWrt's own MAC computation applies.
-MODEFILE="/etc/campus-fix-macmode"
-MACFILE="/etc/campus-fix-wanmac"
-MODE=$(cat "$MODEFILE" 2>/dev/null)
-
-if [ "$MODE" = "factory" ]; then
-  # user explicitly reset to factory: remove any override
-  uci -q delete network.wan.macaddr
-  uci -q commit network
-elif [ "$MODE" = "custom" ] && [ -s "$MACFILE" ]; then
-  # user set a custom MAC via LuCI: apply it (idempotent across reboots)
-  CMAC=$(sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1:\2:\3:\4:\5:\6/' "$MACFILE")
-  if [ -n "$CMAC" ]; then
-    uci -q set network.wan.macaddr="$CMAC"
-    uci -q commit network
-  fi
-fi
-# absent mode file (fresh flash): no action at all - factory MAC stays.
+# --- WAN MAC: no action needed here. Custom MACs set via the LuCI
+# "校园网 MAC" page are persisted directly in uci (network.wan.macaddr),
+# which netifd re-applies on every ifup. Factory MAC is the default.
 
 exit 0

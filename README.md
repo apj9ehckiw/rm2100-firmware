@@ -19,7 +19,7 @@
 | ICMP 时间戳 | type 13/14 DROP（防 OS + 开机时长泄漏） | 同上 |
 | NTP 指纹 | LAN 123 端口重定向到路由器自身 ntpd | 同上 `campus_ntp_redirect` |
 | DHCP 指纹 | WAN 伪装 `DESKTOP-CAMPUS`；LAN vendor-class 统一 | `98-campus-dhcp-fingerprint` |
-| WAN MAC | 默认出厂 MAC（不随机化）；LuCI 页面可查/改/克隆/轮换/复原 | `97-campus-wan-hygiene` + `95-campus-mac-luci` |
+| WAN MAC | 默认出厂 MAC（不随机化）；LuCI 页面可查/改/克隆/轮换/复原（存 uci） | `95-campus-mac-luci` |
 | IPv6 泄漏 | LAN 默认关 RA/DHCPv6 | `99-campus-fix-banner` |
 | 栈指纹 | tcp_timestamps/window_scaling 保持开启、rp_filter 开 | `97-campus-wan-hygiene` |
 | IP-MAC 绑定 / 客户端数 | NAT 天然只暴露路由器单 MAC + 单认证会话 | 无需配置 |
@@ -44,7 +44,7 @@
 - **Reset / 留空保存**：恢复出厂 WAN MAC
 - 改完 `ifup wan` 或重启生效；**除克隆场景外，改 MAC 后要在校园网认证页
   重新登录**（认证会话绑定 MAC）
-- 两种模式（custom / factory）持久化，重启不丢；**默认即出厂 MAC**（v2.6 起不再首刷随机）
+- 自定义 MAC 直接存 uci（`network.wan.macaddr`），重启不丢；**默认即出厂 MAC**（v2.6 起不再首刷随机）
 
 ### LuCI 主题与语言
 
@@ -116,7 +116,7 @@ cat /etc/campus-fix-version        # 应显示 2.6.4
 nft list chain inet fw4 campus_ttl_postrouting     # counter 在涨 = TTL 归一生效
 nft list chain inet fw4 campus_quic_block          # drop 在涨 = 有客户端试图 QUIC
 nft list chain inet fw4 campus_leak_block          # 发现协议封锁生效
-cat /etc/campus-fix-wanmac         # 自定义 MAC（若通过 LuCI 设置过；出厂 MAC 时为空）
+uci -q get network.wan.macaddr     # 自定义 WAN MAC（若通过 LuCI 设置过；出厂 MAC 时为空）
 ```
 
 ## 调整与维护
@@ -162,7 +162,7 @@ files/
 └── etc/uci-defaults/
     ├── 95-campus-mac-luci           # LuCI「Campus MAC」页面
     ├── 96-campus-ntp-server         # 路由器自身 ntpd 开 LAN 监听
-    ├── 97-campus-wan-hygiene        # WAN MAC 三模式 + TCP 栈参数
+    ├── 97-campus-wan-hygiene        # TCP 栈参数（WAN MAC 走 uci，无需重放）
     ├── 98-campus-dhcp-fingerprint   # DHCP 指纹伪装
     └── 99-campus-fix-banner         # 版本戳 + IPv6 RA 关闭 + 登录横幅
 ```
