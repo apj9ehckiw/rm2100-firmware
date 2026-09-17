@@ -3,7 +3,7 @@
 红米 RM AC2100（MediaTek MT7621A，128MB RAM / 16MB flash）专用 OpenWrt 固件，
 内置**校园网多设备检测规避**套件，通过 GitHub Actions 云端构建，本机无需 Linux 环境。
 
-**当前固件版本：v2.4.0**（刷入后 `cat /etc/campus-fix-version` 查询）
+**当前固件版本：v2.4.1**（刷入后 `cat /etc/campus-fix-version` 查询）
 
 ## 功能总览
 
@@ -34,9 +34,9 @@
 - **每主机并发连接数上限**（300，dynamic set）：对抗流数统计。取消注释
   `campus_flowtab4` set 和 `campus_flowcap` chain 两个块。
 
-### LuCI 页面「Campus MAC」（Network 菜单）
+### LuCI 页面「校园网 MAC」（网络菜单）
 
-- **查看**：显示 WAN 口实际生效的 MAC（实时读网卡）
+- **查看**：显示 WAN 口实际生效的 MAC（实时读网卡，页面为简体中文）
 - **手动设置**：填任意合法 MAC。典型用法是**克隆你电脑网卡的 MAC**——
   校园网把认证绑到电脑 MAC 时，克隆后路由器无缝顶替，无需重新注册
 - **Rotate**：一键生成新随机 MAC（本地管理位自动处理），生成后填入框内，点 **Save & Apply** 持久化
@@ -63,7 +63,7 @@
 ## 使用方法
 
 1. **构建**：本仓库已配好 Actions。进 **Actions → Build RM AC2100 OpenWrt
-   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.4.0）直接 Run，
+   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.4.1）直接 Run，
    约 3-5 分钟出包。可调输入：
    - `openwrt_version`：OpenWrt 底包版本
    - `include_luci`：是否带 LuCI（false = 纯 CLI，省内存）
@@ -96,7 +96,7 @@
 ## 首次进系统检查清单
 
 ```
-cat /etc/campus-fix-version        # 应显示 2.4.0
+cat /etc/campus-fix-version        # 应显示 2.4.1
 nft list chain inet fw4 campus_ttl_postrouting     # counter 在涨 = TTL 归一生效
 nft list chain inet fw4 campus_quic_block          # drop 在涨 = 有客户端试图 QUIC
 nft list chain inet fw4 campus_leak_block          # 发现协议封锁生效
@@ -162,3 +162,4 @@ files/
 | v2.3.0 | 修复：IP-ID 规则 `hash`→`jhash`（v2.0 起语法错误导致 fw4 整表加载失败、首刷断网）；MAC 随机化 `od`→`hexdump`（busybox 无 od，原 fallback 会让所有设备同 MAC）；Campus MAC 页面重写为 ucode 实现（24.10 luci-base 无 Lua 运行时，原 Lua CBI 页面静默失效）；NTP interface list→option；CI 增加 nft 语法校验步骤 |
 | v2.3.1 | TTL/hoplimit 默认基准 64 → 128（Windows 指纹；校园认证通常面向 PC，128 亦是更保守的默认） |
 | v2.4.0 | + LuCI Argon 主题（第三方包，构建时自动拉取）+ 界面默认简体中文 |
+| v2.4.1 | 「校园网 MAC」页面全部界面文本改为简体中文（菜单/表单/按钮/通知） |

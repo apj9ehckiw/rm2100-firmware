@@ -99,7 +99,7 @@ mkdir -p /usr/share/luci/menu.d
 cat > /usr/share/luci/menu.d/campusmac.json <<'MENUEOF'
 {
 	"admin/network/campusmac": {
-		"title": "Campus MAC",
+		"title": "校园网 MAC",
 		"order": 76,
 		"action": {
 			"type": "view",
@@ -142,34 +142,33 @@ return view.extend({
 	render: function(live) {
 		var m, s, o;
 
-		m = new form.Map('network', _('Campus MAC'),
-			_('The MAC address your router presents to the campus network. ') +
-			_('A random locally-administered MAC was generated on first boot.') +
-			_('<br /><br /><b>Format:</b> 6 hex pairs separated by colons, e.g. <code>12:34:56:78:9A:BC</code>. ') +
-			_('Leave empty to go back to the router\'s factory WAN MAC.') +
-			_('<br /><br /><b>Effective after</b> <code>ifup wan</code> or reboot. ') +
-			_('Campus portals usually bind the auth session to the MAC - after changing it, re-login on the portal.'));
+		m = new form.Map('network', _('校园网 MAC'),
+			_('路由器在校园网侧呈现的 MAC 地址。首次启动时已生成随机本地管理 MAC。') +
+			_('<br /><br /><b>格式：</b>6 组冒号分隔的十六进制，如 <code>12:34:56:78:9A:BC</code>。') +
+			_('留空保存即可恢复出厂 WAN MAC。') +
+			_('<br /><br /><b>生效方式：</b><code>ifup wan</code> 或重启。') +
+			_('校园网认证通常与 MAC 绑定——修改后需在认证页重新登录。'));
 
-		s = m.section(form.NamedSection, 'wan', 'interface', _('WAN interface'));
+		s = m.section(form.NamedSection, 'wan', 'interface', _('WAN 接口'));
 
-		o = s.option(form.Value, 'macaddr', _('WAN MAC address'),
-			_('Live MAC on the WAN device') + ': <code>' + (live ? (live.mac || _('unknown')) : _('unknown')) + '</code>');
+		o = s.option(form.Value, 'macaddr', _('WAN MAC 地址'),
+			_('WAN 口当前实际 MAC') + ': <code>' + (live ? (live.mac || _('未知')) : _('未知')) + '</code>');
 		o.rmempty = true;
 		o.datatype = 'macaddr';
 
-		o = s.option(form.Button, '_rotate', _('Rotate (new random MAC)'));
+		o = s.option(form.Button, '_rotate', _('换新随机 MAC'));
 		o.inputstyle = 'apply';
-		o.inputtitle = _('Generate');
+		o.inputtitle = _('生成');
 		o.onclick = function(ev) {
 			return callRotate().then(function(ret) {
 				if (ret && ret.mac) {
 					var input = document.querySelector('.cbi-value-field input[id$="macaddr"]');
 					if (input)
 						input.value = ret.mac;
-					ui.addNotification(null, _('New random MAC: <code>%s</code> - click "Save &amp; Apply" to persist.').format(ret.mac), 'info');
+					ui.addNotification(null, _('新随机 MAC：<code>%s</code>——点击「保存并应用」生效。').format(ret.mac), 'info');
 				}
 				else {
-					ui.addNotification(null, _('MAC generation failed'), 'error');
+					ui.addNotification(null, _('MAC 生成失败'), 'error');
 				}
 			});
 		};
