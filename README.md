@@ -3,7 +3,7 @@
 红米 RM AC2100（MediaTek MT7621A，128MB RAM / 16MB flash）专用 OpenWrt 固件，
 内置**校园网多设备检测规避**套件，通过 GitHub Actions 云端构建，本机无需 Linux 环境。
 
-**当前固件版本：v2.6.4**（刷入后 `cat /etc/campus-fix-version` 查询）
+**当前固件版本：v2.6.5**（刷入后 `cat /etc/campus-fix-version` 查询）
 
 ## 功能总览
 
@@ -79,7 +79,7 @@
 ## 使用方法
 
 1. **构建**：本仓库已配好 Actions。进 **Actions → Build RM AC2100 OpenWrt
-   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.6.4）直接 Run，
+   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.6.5）直接 Run，
    约 3-5 分钟出包。可调输入：
    - `openwrt_version`：OpenWrt 底包版本
    - `include_luci`：是否带 LuCI（false = 纯 CLI，省内存）
@@ -112,7 +112,7 @@
 ## 首次进系统检查清单
 
 ```
-cat /etc/campus-fix-version        # 应显示 2.6.4
+cat /etc/campus-fix-version        # 应显示 2.6.5
 nft list chain inet fw4 campus_ttl_postrouting     # counter 在涨 = TTL 归一生效
 nft list chain inet fw4 campus_quic_block          # drop 在涨 = 有客户端试图 QUIC
 nft list chain inet fw4 campus_leak_block          # 发现协议封锁生效
@@ -185,3 +185,4 @@ files/
 | v2.6.2 | 真正根因修复：rpcd ucode 插件的返回值结构错误。rpcd 要求 `return { <对象名>: { <方法名>: { call: fn } } }`（顶层 key 即 ubus 对象名，官方 luci 插件即 `return { luci: methods }`），而 93/95 写成了 `return { status: {call:fn}, ... }`——rpcd 把方法名当对象名校验，报 "Invalid method definition: expected dictionary, got function" 后跳过注册，ubus 上永远没有 campusauth/campusmac 对象，于是 LuCI 报 Object not found / MAC 显示未知（v2.6.1 修的两处确实是 bug 但不是这个症状的根因）。附带修复：rotate 中 hex2dec→hexdec（libucode 内建名）；rpcd restart 改为仅在 rpcd 已运行时执行（首刷时 rpcd 尚未启动，S12 自然加载插件） |
 | v2.6.3 | 修两个状态显示问题。①「校园网认证」状态恒为 unknown：服务从未被 enable/启动（uci-defaults 只写 init 脚本不 enable），且 procd 触发器只在服务首次 start 后才注册——首刷后用户勾选「启用自动认证」保存也不会拉起 daemon。修复：首刷 enable+start 一次（注册 procd 条目与 reload 触发器）+ 写 ucitrack campusauth.json（LuCI 保存即 reload）+ daemon 每轮重读 uci（enabled/凭据/间隔，reload 链全失效也能自愈）+ status() 增加运行中检测（procd pidfile + kill -0，注意 sh 脚本 comm 是 sh 故不能用 pgrep -x）②「校园网 MAC」WAN 口实际 MAC 恒为未知：rpc.js 的 expect 类型校验陷阱——`expect { 'mac': null }` 会在返回值类型（String）与默认值类型（Null）不一致时把真实 MAC 覆盖成 null！改为 `expect { 'mac': '' }`。附：daemon enabled=0/无凭据时写入明确状态文案而非静默 |
 | v2.6.4 | 修复「已在线免认证被误报 probe-failed」：MAC 无感知认证场景（上次认证过+同 MAC），AC 不再劫持 10.0.0.1，daemon 探测拿不到 portal.do 跳转，而 AUTH_OK 是内存态（重启归零）→ 旧逻辑直接报 probe-failed。修复：无劫持跳转时先 ping 公网 DNS（223.5.5.5/119.29.29.29，IP 直连不受 DNS 劫持影响）——通则判定 online(mac-auth/免认证)；不通再按「网关是否应答过 HTTP」细分 offline/probe-failed 文案。真正掉线时 AC 会恢复劫持，主认证路径不受影响 |
+| v2.6.5 | 清理 v2.6.0 MAC 三模式残留死代码：97-campus-wan-hygiene 的 /etc/campus-fix-macmode + /etc/campus-fix-wanmac 开机重放逻辑自 v2.6.0 起无任何代码写入这两个文件，分支永不可达——custom MAC 实际经 LuCI 直存 uci（network.wan.macaddr），netifd 每次 ifup 自动重放。删除不可达分支并同步更正 95 注释与 README（首检清单改 `uci -q get network.wan.macaddr`）。无行为变化，纯清理 |
