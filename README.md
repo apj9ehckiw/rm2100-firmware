@@ -3,7 +3,7 @@
 红米 RM AC2100（MediaTek MT7621A，128MB RAM / 16MB flash）专用 OpenWrt 固件，
 内置**校园网多设备检测规避**套件，通过 GitHub Actions 云端构建，本机无需 Linux 环境。
 
-**当前固件版本：v2.6.7**（刷入后 `cat /etc/campus-fix-version` 查询）
+**当前固件版本：v2.6.8**（刷入后 `cat /etc/campus-fix-version` 查询）
 
 ## 功能总览
 
@@ -79,7 +79,7 @@
 ## 使用方法
 
 1. **构建**：本仓库已配好 Actions。进 **Actions → Build RM AC2100 OpenWrt
-   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.6.7）直接 Run，
+   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.6.8）直接 Run，
    约 3-5 分钟出包。可调输入：
    - `openwrt_version`：OpenWrt 底包版本
    - `include_luci`：是否带 LuCI（false = 纯 CLI，省内存）
@@ -112,7 +112,7 @@
 ## 首次进系统检查清单
 
 ```
-cat /etc/campus-fix-version        # 应显示 2.6.7
+cat /etc/campus-fix-version        # 应显示 2.6.8
 nft list chain inet fw4 campus_ttl_postrouting     # counter 在涨 = TTL 归一生效
 nft list chain inet fw4 campus_quic_block          # drop 在涨 = 有客户端试图 QUIC
 nft list chain inet fw4 campus_leak_block          # 发现协议封锁生效
@@ -188,3 +188,4 @@ files/
 | v2.6.5 | 清理 v2.6.0 MAC 三模式残留死代码：97-campus-wan-hygiene 的 /etc/campus-fix-macmode + /etc/campus-fix-wanmac 开机重放逻辑自 v2.6.0 起无任何代码写入这两个文件，分支永不可达——custom MAC 实际经 LuCI 直存 uci（network.wan.macaddr），netifd 每次 ifup 自动重放。删除不可达分支并同步更正 95 注释与 README（首检清单改 `uci -q get network.wan.macaddr`）。无行为变化，纯清理 |
 | v2.6.6 | 「校园网认证」页学号输入框增加掩码显示（∗ 显隐切换按钮），与密码框交互一致。仅 UI 层，uci 明文存储与 daemon/rpcd 读取路径不变 |
 | v2.6.7 | 在线检测从 ICMP 换为 HTTP generate_204 双探测点（connect.rom.miui.com / 204.ustclug.org）：该校工作日 23:30 强制断网时 HTTP+DNS 全断、仅 ICMP 放行（ping 223.5.5.5 通但 ping qq.com 不通），纯 ping 检测会把停机误判为在线。新方案：真在线=204 空正文；未认证=劫持页含 portal.do；停机=DNS/连接失败。ICMP 降级为纯诊断信号（区分「停机断网」与「完全断网」文案）；check_online 每轮执行（原来 AUTH_OK=1 时跳过），停机即时感知、AUTH_OK 归零、恢复后 AC 重新劫持即自动重认证；新增 portal-transition 状态（探测到劫持页但 10.0.0.1 未恢复劫持跳转的 AC 过渡态）；停机期间启动路由器不再误报 probe-failed/offline |
+| v2.6.8 | 自动认证调度：新增运行时间区间（active_start/active_end，HH:MM，支持跨午夜如 22:00-06:00，留空=全天）与运行星期开关（day_1~day_6/day_0 复选框，默认每天）。两层闸门独立组合：时段外/未勾选当天暂停一切探测与登录（状态显示 paused 及原因）；配置畸形 fail-open（视为全天/每天，手误不至于让认证哑火）；跨午夜窗口 00:00 后按新一天判断。LuCI 无 'time' datatype（未注册类型会让 Validator 抛错毁表单），HH:MM 校验用自定义 validate；shell test 无 >= 操作符用 NOT(小于) 组合（20+11 单测用例全过） |
