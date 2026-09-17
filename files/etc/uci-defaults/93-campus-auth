@@ -98,8 +98,38 @@ read_config() {
 	PASSWD=$(uci -q get campusauth.login.password)
 	ACTIVE_START=$(uci -q get campusauth.login.active_start)
 	ACTIVE_END=$(uci -q get campusauth.login.active_end)
+	# day_N: 1 = run on that weekday (date +%w: 0=Sun .. 6=Sat). All unset
+	#   -> every day (fail-open, same policy as the time window).
+	DAYS=""
+	local d
+	for d in 0 1 2 3 4 5 6; do
+		[ "$(uci -q get campusauth.login.day_$d)" = "1" ] && DAYS="$DAYS $d"
+	done
 }
 read_config
+
+# Is today an enabled weekday? (empty DAYS -> all days enabled)
+is_active_day() {
+	[ -z "${DAYS// /}" ] && return 0
+	case " $DAYS " in
+		*" $(date '+%w') "*) return 0 ;;
+	esac
+	return 1
+}
+
+# date +%w (0=Sun..6=Sat) -> Chinese weekday name for status text
+weekday_cn() {
+	case "$1" in
+		0) echo "周日" ;;
+		1) echo "周一" ;;
+		2) echo "周二" ;;
+		3) echo "周三" ;;
+		4) echo "周四" ;;
+		5) echo "周五" ;;
+		6) echo "周六" ;;
+		*) echo "?" ;;
+	esac
+}
 
 # Is the current wall-clock time inside the active window?
 #   empty start/end        -> always active (default)
@@ -243,6 +273,13 @@ while true; do
 	# force-disconnect window instead of retrying all night). Keep
 	# AUTH_OK as-is: re-entering the window re-runs the full state
 	# machine anyway (check_online / hijack paths both handle it).
+	# Weekday gate first (date +%w of the CURRENT moment - an overnight
+	# window crossing midnight belongs to the new day after 00:00).
+	if ! is_active_day; then
+		set_status "paused（今日（$(weekday_cn "$(date '+%w')")）不运行，暂停探测） $(date '+%Y-%m-%d %H:%M:%S')"
+		sleep "$INTERVAL"
+		continue
+	fi
 	if ! in_active_window; then
 		set_status "paused（超出运行时段 ${ACTIVE_START}-${ACTIVE_END}，暂停探测） $(date '+%Y-%m-%d %H:%M:%S')"
 		sleep "$INTERVAL"
@@ -381,6 +418,14 @@ config login 'login'
 	option interval '90'
 	option active_start ''
 	option active_end ''
+# day_N: 1 = run on that weekday (0=Sun 1=Mon .. 6=Sat); unset = all days
+	option day_1 '1'
+	option day_2 '1'
+	option day_3 '1'
+	option day_4 '1'
+	option day_5 '1'
+	option day_6 '1'
+	option day_0 '1'
 
 config portal 'portal'
 	option portal_ip '10.1.110.2'
@@ -456,6 +501,7 @@ return {
 					interval: uci.get('campusauth', 'login', 'interval') || '90',
 					active_start: uci.get('campusauth', 'login', 'active_start') || '',
 					active_end: uci.get('campusauth', 'login', 'active_end') || '',
+					days: ['1','2','3','4','5','6','0'].filter(d => uci.get('campusauth', 'login', 'day_' + d) == '1'),
 					portal_ip: uci.get('campusauth', 'portal', 'portal_ip') || '10.1.110.2'
 				};
 			}
@@ -684,6 +730,21 @@ return view.extend({
 		o.rmempty = true;
 		o.placeholder = '23:30';
 		o.validate = validateHHMM;
+
+		s = m.section(form.NamedSection, 'login', 'login', _('运行星期'));
+		s.description = _('自动认证在一周中的哪几天运行。跨午夜时段（如 22:00-06:00）在 00:00 后属于新的一天。') + '<br />' +
+			_('提示：全部取消勾选等同于每天运行；如果哪天都不想运行，直接关闭上方的「启用自动认证」即可。');
+
+		var weekdays = [
+			[ 'day_1', _('周一') ], [ 'day_2', _('周二') ], [ 'day_3', _('周三') ],
+			[ 'day_4', _('周四') ], [ 'day_5', _('周五') ], [ 'day_6', _('周六') ],
+			[ 'day_0', _('周日') ]
+		];
+		for (var i = 0; i < weekdays.length; i++) {
+			o = s.option(form.Flag, weekdays[i][0], weekdays[i][1]);
+			o.rmempty = false;
+			o.default = '1';
+		}
 
 		s = m.section(form.NamedSection, 'portal', 'portal', _('Portal 服务器'));
 
