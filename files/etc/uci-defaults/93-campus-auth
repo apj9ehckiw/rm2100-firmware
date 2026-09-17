@@ -529,6 +529,7 @@ return view.extend({
 		o = s.option(form.Value, 'username', _('学号'));
 		o.rmempty = false;
 		o.datatype = 'string';
+		o.password = true;
 
 		o = s.option(form.Value, 'password', _('密码'));
 		o.password = true;
