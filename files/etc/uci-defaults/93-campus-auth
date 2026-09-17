@@ -1,0 +1,509 @@
+#!/bin/sh
+# campus-fix v2.5: campus portal auto-login daemon + LuCI page.
+#
+# Reverse-engineered from a HAR capture of the portal flow
+# (广东某职业院校 / 中山校区 Portal, NFV-BASE-1 AC):
+#   1) Any HTTP request gets hijacked to http://10.0.0.1/, which returns a
+#      JS redirect to http://10.1.110.2/portal.do?<params>. We skip the
+#      hijack dance and query the status endpoint directly.
+#   2) GET http://10.1.110.2/PortalJsonAction.do?<params>&viewStatus=1
+#      -> JSON with portalconfig{timestamp,uuid,sign},
+#         serverForm{serverip(=wlanacIp),portalVer},
+#         portalForm{mac,vlan,wlanacname,wlanuserip}
+#   3) GET http://10.1.110.2/quickauth.do?userid=..&passwd=..&<params from
+#      step 2>&timestamp=..&uuid=..   (plaintext GET; authByRas=false in
+#      this deployment, so no RSA)
+#      -> code=0 success, 201 already online, -1 fail (retryable),
+#         236/237/238 need device binding (manual action required)
+#   4) Logout: POST /quickauthdisconn.do with wlanacip/wlanuserip/
+#      wlanacname/version/portaltype/userid/mac/groupId
+#
+# The daemon (campus-auth) runs from procd:
+#   - detects the router's WAN IP / AC name / MAC by probing the hijack GW
+#   - logs in with credentials from UCI (campusauth.@login[0])
+#   - re-checks every CHECK_INTERVAL; re-auths when kicked
+#
+# UCI config (/etc/config/campusauth):
+#   config login 'login'
+#     option username '...'
+#     option password '...'
+#     option enabled '1'
+#     option interval '90'          # seconds between online checks
+#   config portal 'portal'
+#     option portal_ip '10.1.110.2' # override if AC IP differs
+#
+# NOTE: credentials live in /etc/config/campusauth (root-only, 0600).
+
+PORTAL_IP=$(uci -q get campusauth.portal.portal_ip || echo "10.1.110.2")
+CONF=/etc/config/campusauth
+
+# --- 1) init script: procd service --------------------------------------
+mkdir -p /etc/init.d
+cat > /etc/init.d/campus-auth <<'INITEOF'
+#!/bin/sh /etc/rc.common
+# campus portal auto-login daemon
+START=99
+STOP=15
+USE_PROCD=1
+
+PROG=/usr/bin/campus-auth
+
+start_service() {
+	[ "$(uci -q get campusauth.login.enabled)" = "1" ] || {
+		logger -t campus-auth "disabled in uci (campusauth.login.enabled != 1); not starting"
+		return 0
+	}
+	procd_open_instance
+	procd_set_param command "$PROG"
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param pidfile /var/run/campus-auth.pid
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger campusauth
+}
+
+reload_service() {
+	stop
+	start
+}
+INITEOF
+chmod +x /etc/init.d/campus-auth
+
+# --- 2) auth daemon ------------------------------------------------------
+mkdir -p /usr/bin
+cat > /usr/bin/campus-auth <<'DAEMONEOF'
+#!/bin/sh
+# campus portal auto-login daemon (procd supervised)
+# Writes state to /tmp/campus-auth.status for the LuCI page.
+
+PORTAL_IP=$(uci -q get campusauth.portal.portal_ip || echo "10.1.110.2")
+INTERVAL=$(uci -q get campusauth.login.interval || echo "90")
+USERID=$(uci -q get campusauth.login.username)
+PASSWD=$(uci -q get campusauth.login.password)
+STATUS_FILE=/tmp/campus-auth.status
+UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+log() { logger -t campus-auth "$1"; }
+set_status() { echo "$1" > "$STATUS_FILE"; }
+
+# fetch url -> stdout (uclient-fetch; wget is its alias on OpenWrt)
+fetch() {
+	uclient-fetch -q -T 8 --user-agent "$UA" -O - "$1" 2>/dev/null
+}
+
+# probe the hijack gateway to learn our session params:
+# any http:// request returns a JS redirect containing the full portal URL.
+# We use the status API afterwards to get the authoritative portalForm.
+probe_params() {
+	local body redirect
+	body=$(fetch "http://10.0.0.1/") || return 1
+	redirect=$(echo "$body" | grep -o 'http://[^"]*portal\.do[^"]*' | head -1)
+	[ -n "$redirect" ] || return 1
+	# extract params from the portal.do URL
+	echo "$redirect"
+}
+
+# GET PortalJsonAction.do and echo raw JSON
+portal_status() {
+	local url="$1"
+	fetch "http://$PORTAL_IP/PortalJsonAction.do?$url&viewStatus=1"
+}
+
+# percent-encode chars that break query strings (& % + # space etc.)
+urlencode() {
+	echo "$1" | sed -e 's/%/%25/g' -e 's/&/%26/g' -e 's/+/%2B/g' -e 's/#/%23/g' -e 's/ /%20/g' -e 's/?/%3F/g'
+}
+
+json_get() {
+	# json_get '<json>' '<key>' -> value (simple regex, no shell json deps)
+	echo "$1" | grep -o "\"$2\"[[:space:]]*:[[:space:]]*\"\{0,1\}[^\"]*\"*[,}]" \
+		| head -1 | sed "s/.*:[[:space:]]*//;s/[\",}]//g"
+}
+
+AUTH_OK=0
+ONLINE_STAMP=0
+
+while true; do
+	# --- gather session params ----------------------------------------
+	# The hijack gateway only answers with a portal.do redirect while the
+	# session is UNAUTHENTICATED. Once online, 10.0.0.1 stops hijacking
+	# (or does not respond), which itself is a reliable "still online"
+	# signal - and avoids hammering quickauth every cycle (constant
+	# re-auth attempts are a behavioral anomaly the campus could flag).
+	REDIRECT=$(probe_params)
+	if [ -z "$REDIRECT" ]; then
+		if [ "$AUTH_OK" = "1" ]; then
+			set_status "online(no-hijack) $(date '+%Y-%m-%d %H:%M:%S')"
+		else
+			set_status "probe-failed $(date '+%Y-%m-%d %H:%M:%S')"
+			log "hijack gateway probe failed (gateway down or portal moved)"
+		fi
+		sleep "$INTERVAL"
+		continue
+	fi
+	Q=$(echo "$REDIRECT" | sed 's/.*portal\..do?//')
+	echo "$Q" > /tmp/campus-auth.params
+
+	JSON=$(portal_status "$Q")
+	if [ -n "$JSON" ]; then
+		TIMESTAMP=$(json_get "$JSON" timestamp)
+		UUID=$(json_get "$JSON" uuid)
+		ACIP=$(echo "$JSON" | grep -o '"serverip"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*: *"//;s/"//')
+		USERIP=$(echo "$JSON" | grep -o '"wlanuserip"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*: *"//;s/"//')
+		ACNAME=$(echo "$JSON" | grep -o '"wlanacname"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*: *"//;s/"//')
+		MAC=$(echo "$JSON" | grep -o '"mac"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*: *"//;s/"//')
+		VLAN=$(echo "$JSON" | grep -o '"vlan"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*: *"//;s/"//')
+
+		# --- try login ------------------------------------------------
+		MAC_ENC=$(echo "$MAC" | sed 's/:/%3A/g')
+		USERID_ENC=$(urlencode "$USERID")
+		PASSWD_ENC=$(urlencode "$PASSWD")
+		AUTH_URL="http://$PORTAL_IP/quickauth.do?userid=$USERID_ENC&passwd=$PASSWD_ENC&wlanuserip=$USERIP&wlanacname=$ACNAME&wlanacIp=$ACIP&ssid=&vlan=$VLAN&mac=$MAC_ENC&version=0&portalpageid=1&timestamp=$TIMESTAMP&uuid=$UUID&portaltype=0&hostname=&bindCtrlId="
+		RESP=$(fetch "$AUTH_URL")
+		CODE=$(json_get "$RESP" code)
+
+		case "$CODE" in
+			0)
+				AUTH_OK=1; ONLINE_STAMP=$(date +%s)
+				set_status "online $(date '+%Y-%m-%d %H:%M:%S') ip=$USERIP ac=$ACNAME"
+				log "login ok (ip=$USERIP ac=$ACNAME)"
+				;;
+			201)
+				AUTH_OK=1; ONLINE_STAMP=$(date +%s)
+				set_status "online(already) $(date '+%Y-%m-%d %H:%M:%S') ip=$USERIP"
+				log "already online (code=201)"
+				;;
+			236|237|238)
+				set_status "bind-required code=$CODE $(date '+%Y-%m-%d %H:%M:%S')"
+				log "portal requires device binding (code=$CODE); manual action needed"
+				;;
+			-1|"")
+				set_status "failed code=$CODE $(date '+%Y-%m-%d %H:%M:%S')"
+				log "login failed (code=$CODE), retrying"
+				;;
+			*)
+				set_status "unknown code=$CODE $(date '+%Y-%m-%d %H:%M:%S')"
+				log "portal returned code=$CODE"
+				;;
+		esac
+	else
+		set_status "no-portal-response $(date '+%Y-%m-%d %H:%M:%S')"
+		log "PortalJsonAction unreachable"
+	fi
+
+	sleep "$INTERVAL"
+done
+DAEMONEOF
+chmod +x /usr/bin/campus-auth
+
+# --- 3) default UCI config (credentials empty - set via LuCI or uci) -----
+touch "$CONF"
+cat > "$CONF" <<'UCIEOF'
+config login 'login'
+	option enabled '0'
+	option username ''
+	option password ''
+	option interval '90'
+
+config portal 'portal'
+	option portal_ip '10.1.110.2'
+UCIEOF
+chmod 600 "$CONF"
+
+# --- 4) rpcd backend for the LuCI page -----------------------------------
+mkdir -p /usr/share/rpcd/ucode
+cat > /usr/share/rpcd/ucode/campusauth <<'UCEOF'
+// campus-auth rpcd backend: status read + manual login/logout
+'use strict';
+
+import { readfile, popen } from 'fs';
+import { cursor } from 'uci';
+
+const q = "'";
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+
+function enc(s) {
+	// percent-encode query-string-hostile chars (covers typical passwords)
+	return replace(replace(replace(replace(replace(replace(s ?? '', '%', '%25'), '&', '%26'), '+', '%2B'), '#', '%23'), ' ', '%20'), '?', '%3F');
+}
+
+function fetch(url) {
+	let p = popen('uclient-fetch -q -T 8 --user-agent ' + q + UA + q + ' -O - ' + q + url + q + ' 2>/dev/null');
+	let out = p.read('all');
+	p.close();
+	return out ?? '';
+}
+
+function jget(json, key) {
+	let m = match(json, new RegExp('"' + key + '"\\s*:\\s*("([^"]*)"|[0-9]+|true|false|null)'));
+	return m ? (m[2] ?? m[1]) : null;
+}
+
+return {
+	status: {
+		call: function(request, args) {
+			let st = trim(readfile('/tmp/campus-auth.status') ?? '');
+			let uci = cursor();
+			return {
+				status: st || 'unknown',
+				enabled: uci.get('campusauth', 'login', 'enabled') || '0',
+				username: uci.get('campusauth', 'login', 'username') || '',
+				has_password: (uci.get('campusauth', 'login', 'password') || '') != '',
+				interval: uci.get('campusauth', 'login', 'interval') || '90',
+				portal_ip: uci.get('campusauth', 'portal', 'portal_ip') || '10.1.110.2'
+			};
+		}
+	},
+
+	login: {
+		// force one immediate auth attempt (daemon picks it up next cycle,
+		// or we do an inline attempt for instant feedback)
+		call: function(request, args) {
+			let uci = cursor();
+			let userid = uci.get('campusauth', 'login', 'username');
+			let passwd = uci.get('campusauth', 'login', 'password');
+			let portal_ip = uci.get('campusauth', 'portal', 'portal_ip') || '10.1.110.2';
+
+			if (!userid || !passwd)
+				return { code: null, error: '学号或密码未设置' };
+
+			// probe hijack gateway for session params
+			let body = fetch('http://10.0.0.1/');
+			let redirect = match(body ?? '', /http:\/\/[^"']*portal\.do\?[^"']*/);
+			if (!redirect)
+				return { code: null, error: '无法获取认证参数（可能已在线或网关不可达）' };
+
+			let qp = split(substr(redirect[0], index(redirect[0], '?') + 1), '&');
+			let params = {};
+			for (let kv in qp) {
+				let i = index(kv, '=');
+				if (i > 0)
+					params[substr(kv, 0, i)] = substr(kv, i + 1);
+			}
+
+			let url = 'http://' + portal_ip + '/PortalJsonAction.do?' +
+				'wlanuserip=' + (params.wlanuserip ?? '') +
+				'&wlanacname=' + (params.wlanacname ?? '') +
+				'&mac=' + (params.mac ?? '') +
+				'&vlan=' + (params.vlan ?? '') +
+				'&viewStatus=1';
+			let json = fetch(url);
+			if (!json)
+				return { code: null, error: 'PortalJsonAction 无响应' };
+
+			let ts = jget(json, 'timestamp');
+			let uuid = jget(json, 'uuid');
+			let acip = jget(json, 'serverip');
+			let userip = jget(json, 'wlanuserip');
+			let acname = jget(json, 'wlanacname');
+			let mac = jget(json, 'mac');
+			let vlan = jget(json, 'vlan');
+
+			if (!ts || !uuid)
+				return { code: null, error: 'portal 配置解析失败' };
+
+			let auth_url = 'http://' + portal_ip + '/quickauth.do?userid=' + enc(userid) +
+				'&passwd=' + enc(passwd) +
+				'&wlanuserip=' + userip + '&wlanacname=' + acname +
+				'&wlanacIp=' + acip + '&ssid=&vlan=' + vlan +
+				'&mac=' + replace(mac ?? '', ':', '%3A') + '&version=0&portalpageid=1' +
+				'&timestamp=' + ts + '&uuid=' + uuid +
+				'&portaltype=0&hostname=&bindCtrlId=';
+			let resp = fetch(auth_url);
+			let code = jget(resp, 'code');
+			let message = jget(resp, 'message');
+
+			return { code: code, message: message };
+		}
+	},
+
+	logout: {
+		call: function(request, args) {
+			let uci = cursor();
+			let portal_ip = uci.get('campusauth', 'portal', 'portal_ip') || '10.1.110.2';
+			let userid = uci.get('campusauth', 'login', 'username') || '';
+
+			let qp = trim(readfile('/tmp/campus-auth.params') ?? '');
+			let p = {};
+			for (let kv in split(qp, '&')) {
+				let i = index(kv, '=');
+				if (i > 0)
+					p[substr(kv, 0, i)] = substr(kv, i + 1);
+			}
+
+			let url = 'http://' + portal_ip + '/quickauthdisconn.do';
+			let cmd = 'uclient-fetch -q -T 8 --user-agent ' + q + UA + q +
+				' --post-data=' + q +
+				'wlanacip=' + (p.wlanacip ?? '10.1.110.3') +
+				'&wlanuserip=' + (p.wlanuserip ?? '') +
+				'&wlanacname=' + (p.wlanacname ?? '') +
+				'&version=0&portaltype=0&userid=' + userid +
+				'&mac=' + (p.mac ?? '') + '&groupId=' + (args?.groupId ?? '2') +
+				q + ' -O - ' + q + url + q + ' 2>/dev/null';
+			let exec = popen(cmd);
+			let out = exec.read('all');
+			exec.close();
+			return { code: jget(out, 'code'), message: jget(out, 'message') };
+		}
+	}
+};
+UCEOF
+
+# --- 5) ACL --------------------------------------------------------------
+mkdir -p /usr/share/rpcd/acl.d
+cat > /usr/share/rpcd/acl.d/campusauth.json <<'JSONEOF'
+{
+	"campusauth": {
+		"description": "Campus portal auth page backend",
+		"read": {
+			"ubus": {
+				"campusauth": [ "status", "login", "logout" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"campusauth": [ "status", "login", "logout" ]
+			},
+			"uci": {
+				"campusauth": [ "read", "write" ]
+			},
+			"file": {
+				"/usr/bin/campus-auth": [ "exec" ]
+			}
+		}
+	}
+}
+JSONEOF
+
+# --- 6) menu entry -------------------------------------------------------
+mkdir -p /usr/share/luci/menu.d
+cat > /usr/share/luci/menu.d/campusauth.json <<'MENUEOF'
+{
+	"admin/network/campusauth": {
+		"title": "校园网认证",
+		"order": 77,
+		"action": {
+			"type": "view",
+			"path": "campusauth"
+		},
+		"depends": {
+			"acl": [ "campusauth" ],
+			"uci": { "campusauth": true }
+		}
+	}
+}
+MENUEOF
+
+# --- 7) LuCI view (JS) ----------------------------------------------------
+mkdir -p /www/luci-static/resources/view
+cat > /www/luci-static/resources/view/campusauth.js <<'JSEOF'
+'use strict';
+'require view';
+'require ui';
+'require rpc';
+'require form';
+
+var callStatus = rpc.declare({
+	object: 'campusauth',
+	method: 'status',
+	expect: {}
+});
+
+var callLogin = rpc.declare({
+	object: 'campusauth',
+	method: 'login',
+	expect: {}
+});
+
+var callLogout = rpc.declare({
+	object: 'campusauth',
+	method: 'logout',
+	expect: {}
+});
+
+return view.extend({
+	load: function() {
+		return L.resolveDefault(callStatus(), {});
+	},
+
+	render: function(st) {
+		var m, s, o;
+
+		m = new form.Map('campusauth', _('校园网认证'),
+			_('校园网 Portal 自动认证（抓包逆向实现）。保存凭据并启用后，后台服务会自动登录并掉线重连。') +
+			_('<br /><br />当前状态：<code>%s</code>').format(st.status || '未知'));
+
+		s = m.section(form.NamedSection, 'login', 'login', _('认证设置'));
+
+		o = s.option(form.Flag, 'enabled', _('启用自动认证'));
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'username', _('学号'));
+		o.rmempty = false;
+		o.datatype = 'string';
+
+		o = s.option(form.Value, 'password', _('密码'));
+		o.password = true;
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'interval', _('检测间隔（秒）'),
+			_('每间隔多少秒检查一次在线状态，掉线后自动重新认证。'));
+		o.rmempty = false;
+		o.datatype = 'range(30, 3600)';
+		o.placeholder = '90';
+
+		s = m.section(form.NamedSection, 'portal', 'portal', _('Portal 服务器'));
+
+		o = s.option(form.Value, 'portal_ip', _('Portal 地址'),
+			_('认证服务器 IP，一般无需修改。'));
+		o.rmempty = false;
+		o.datatype = 'ipaddr';
+		o.placeholder = '10.1.110.2';
+
+		o = s.option(form.Button, '_login', _('立即认证'));
+		o.inputstyle = 'apply';
+		o.inputtitle = _('登录');
+		o.onclick = function(ev) {
+			return callLogin().then(function(ret) {
+				if (ret && (ret.code == '0' || ret.code == 0)) {
+					ui.addNotification(null, _('认证成功，已上线。'), 'info');
+				}
+				else if (ret && (ret.code == '201')) {
+					ui.addNotification(null, _('已在线，无需重复认证。'), 'info');
+				}
+				else if (ret && ret.error) {
+					ui.addNotification(null, _('认证失败：%s').format(ret.error), 'error');
+				}
+				else {
+					ui.addNotification(null, _('认证失败（code=%s）：可能是学号密码错误或需要设备绑定。').format(ret ? ret.code : '?'), 'error');
+				}
+			});
+		};
+
+		o = s.option(form.Button, '_logout', _('手动下线'));
+		o.inputstyle = 'reset';
+		o.inputtitle = _('下线');
+		o.onclick = function(ev) {
+			return callLogout().then(function(ret) {
+				if (ret && (ret.code == '0' || ret.code == 0)) {
+					ui.addNotification(null, _('已下线。'), 'info');
+				}
+				else {
+					ui.addNotification(null, _('下线失败（code=%s）').format(ret ? ret.code : '?'), 'error');
+				}
+			});
+		};
+
+		return m.render();
+	}
+});
+JSEOF
+
+# enable on boot only if user later sets enabled=1 (uci default is 0)
+rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* 2>/dev/null
+
+exit 0

@@ -3,7 +3,7 @@
 红米 RM AC2100（MediaTek MT7621A，128MB RAM / 16MB flash）专用 OpenWrt 固件，
 内置**校园网多设备检测规避**套件，通过 GitHub Actions 云端构建，本机无需 Linux 环境。
 
-**当前固件版本：v2.4.1**（刷入后 `cat /etc/campus-fix-version` 查询）
+**当前固件版本：v2.5.0**（刷入后 `cat /etc/campus-fix-version` 查询）
 
 ## 功能总览
 
@@ -24,6 +24,7 @@
 | 栈指纹 | tcp_timestamps/window_scaling 保持开启、rp_filter 开 | `97-campus-wan-hygiene` |
 | IP-MAC 绑定 / 客户端数 | NAT 天然只暴露路由器单 MAC + 单认证会话 | 无需配置 |
 | UA/系统指纹 | 路由器层无法改写 HTTPS 内 UA；QUIC 已封后用终端浏览器扩展做 UA 一致化 | 终端侧 |
+| Portal 认证 | 校园网 Portal 自动登录/掉线重连（quickauth 协议，凭据存路由器） | LuCI「校园网认证」页面 |
 
 ### 可选开关（默认关，按需开）
 
@@ -53,6 +54,21 @@
   想跟随浏览器就改回 `auto`）
 - `include_luci=false` 构建时不含主题与语言包（纯 CLI）
 
+### 校园网认证（LuCI「校园网认证」页面）
+
+基于认证流程抓包逆向实现的 Portal 自动认证：
+
+- **自动登录**：填学号密码并启用后，后台守护进程每 90 秒（可调）检测一次；
+  被踢下线后自动重新认证，无需手动开认证页
+- **检测机制**：未认证时任意 HTTP 请求会被劫持到 10.0.0.1——探测不到劫持即视为在线，
+  不会反复发认证请求（避免行为异常）
+- **手动操作**：页面提供「登录/下线」按钮即时操作，实时显示认证状态
+- **凭据安全**：学号密码存在 `/etc/config/campusauth`（权限 0600，仅 root 可读）
+- **认证协议**：GET `quickauth.do`（明文 HTTP，该校部署未启用 RSA 加密）；
+  code=0 成功 / 201 已在线 / 236-238 需设备绑定（需手动处理）/ -1 失败重试
+- **注意**：密码经明文 HTTP 传输给认证服务器——这是该校 Portal 本身的协议设计，
+  与本固件无关；有线/无线校园网内嗅探者理论上可见
+
 ### 刻意不做的（及理由）
 
 - **不封 DoH**：走 443/TCP 与正常流量无法区分，误伤太大；QUIC 已封，
@@ -63,7 +79,7 @@
 ## 使用方法
 
 1. **构建**：本仓库已配好 Actions。进 **Actions → Build RM AC2100 OpenWrt
-   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.4.1）直接 Run，
+   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.5.0）直接 Run，
    约 3-5 分钟出包。可调输入：
    - `openwrt_version`：OpenWrt 底包版本
    - `include_luci`：是否带 LuCI（false = 纯 CLI，省内存）
@@ -96,7 +112,7 @@
 ## 首次进系统检查清单
 
 ```
-cat /etc/campus-fix-version        # 应显示 2.4.1
+cat /etc/campus-fix-version        # 应显示 2.5.0
 nft list chain inet fw4 campus_ttl_postrouting     # counter 在涨 = TTL 归一生效
 nft list chain inet fw4 campus_quic_block          # drop 在涨 = 有客户端试图 QUIC
 nft list chain inet fw4 campus_leak_block          # 发现协议封锁生效
@@ -163,3 +179,4 @@ files/
 | v2.3.1 | TTL/hoplimit 默认基准 64 → 128（Windows 指纹；校园认证通常面向 PC，128 亦是更保守的默认） |
 | v2.4.0 | + LuCI Argon 主题（第三方包，构建时自动拉取）+ 界面默认简体中文 |
 | v2.4.1 | 「校园网 MAC」页面全部界面文本改为简体中文（菜单/表单/按钮/通知） |
+| v2.5.0 | + 校园网 Portal 自动认证：quickauth 协议自动登录/掉线重连守护进程 + LuCI「校园网认证」页面（凭据/间隔/Portal 地址可配，手动登录/下线） |
