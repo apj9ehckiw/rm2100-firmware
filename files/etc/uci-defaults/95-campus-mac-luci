@@ -49,43 +49,51 @@ function wan_device() {
 	return dev;
 }
 
+// rpcd ucode plugins must return:
+//   { <ubus-object-name>: { <method>: { call: fn, args: {...} }, ... } }
+// (rpcd ucode.c rpc_ucode_script_validate: the top-level key IS the ubus
+// object name; the official luci plugin does `return { luci: methods }`).
+// We register the object `campusmac` with methods livemac/rotate.
 return {
-	livemac: {
-		call: function(request, args) {
-			let dev = wan_device();
+	campusmac: {
+		livemac: {
+			call: function(request, args) {
+				let dev = wan_device();
 
-			if (!dev)
-				return { mac: null, error: 'no wan device' };
+				if (!dev)
+					return { mac: null, error: 'no wan device' };
 
-			let mac = trim(readfile(`/sys/class/net/${dev}/address`) ?? '');
+				let mac = trim(readfile(`/sys/class/net/${dev}/address`) ?? '');
 
-			// fallback: the configured uci override (matches what will
-			// apply on next ifup even if the device is down right now)
-			if (!mac) {
-				let uci = cursor();
-				mac = uci.get('network', 'wan', 'macaddr') ?? '';
+				// fallback: the configured uci override (matches what will
+				// apply on next ifup even if the device is down right now)
+				if (!mac) {
+					let uci = cursor();
+					mac = uci.get('network', 'wan', 'macaddr') ?? '';
+				}
+
+				return { mac: mac || null, device: dev };
 			}
+		},
 
-			return { mac: mac || null, device: dev };
-		}
-	},
+		rotate: {
+			call: function(request, args) {
+				// hexdump (NOT od - od is not in the OpenWrt busybox applet set)
+				let p = popen('hexdump -vn6 -e ' + q + '6/1 "%02x"' + q + ' /dev/urandom');
+				let out = p.read('all');
+				p.close();
 
-	rotate: {
-		call: function(request, args) {
-			// hexdump (NOT od - od is not in the OpenWrt busybox applet set)
-			let p = popen('hexdump -vn6 -e ' + q + '6/1 "%02x"' + q + ' /dev/urandom');
-			let out = p.read('all');
-			p.close();
+				let hex = replace(out, /[^0-9a-f]/g, '');
 
-			let hex = replace(out, /[^0-9a-f]/g, '');
+				if (length(hex) < 12)
+					return { mac: null, error: 'random source failed' };
 
-			if (length(hex) < 12)
-				return { mac: null, error: 'random source failed' };
+				// first byte: locally-administered unicast (bit1 set, bit0 clear)
+				// (ucode builtin is hexdec - hex2dec does not exist)
+				let b1 = (hexdec(substr(hex, 0, 2)) | 0x02) & 0xFE;
 
-			// first byte: locally-administered unicast (bit1 set, bit0 clear)
-			let b1 = (hex2dec(substr(hex, 0, 2)) | 0x02) & 0xFE;
-
-			return { mac: sprintf('%02x%s', b1, substr(hex, 2, 10)) };
+				return { mac: sprintf('%02x%s', b1, substr(hex, 2, 10)) };
+			}
 		}
 	}
 };
@@ -198,11 +206,14 @@ JSEOF
 # reload luci caches so the page appears without manual flush
 rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* 2>/dev/null
 
-# rpcd scans /usr/share/rpcd/ucode/ only at startup; it is already running
-# during first-boot uci-defaults, so the campusmac plugin written above would
-# NOT be registered until the next reboot - the LuCI page would show
-# "未知" (the ubus call fails, JS falls back to {}). Restart rpcd now to
-# register the plugin immediately. Safe at this point: no LuCI sessions yet.
-/etc/init.d/rpcd restart 2>/dev/null || killall -HUP rpcd 2>/dev/null
+# rpcd scans /usr/share/rpcd/ucode/ only at startup. During FIRST BOOT this
+# script runs inside boot's uci_apply_defaults, BEFORE S12rpcd starts - so
+# rpcd will pick the plugins up naturally and no restart is needed (restarting
+# here would merely start rpcd prematurely). Only when this script is re-run
+# on an ALREADY-booted system (rpcd running) do we restart it to register the
+# freshly written plugins.
+if pgrep -x rpcd >/dev/null 2>&1; then
+	/etc/init.d/rpcd restart 2>/dev/null || killall -HUP rpcd 2>/dev/null
+fi
 
 exit 0

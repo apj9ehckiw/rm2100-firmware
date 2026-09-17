@@ -245,111 +245,119 @@ function jget(json, key) {
 	return m ? (m[2] ?? m[1]) : null;
 }
 
+// rpcd ucode plugins must return:
+//   { <ubus-object-name>: { <method>: { call: fn, args: {...} }, ... } }
+// (see rpcd ucode.c rpc_ucode_script_validate: the top-level key IS the
+// ubus object name, the second level are method definitions). The official
+// luci plugin does `return { luci: methods }` - we mirror that shape with
+// the object name `campusauth` so the LuCI page's rpc.declare calls resolve.
 return {
-	status: {
-		call: function(request, args) {
-			let st = trim(readfile('/tmp/campus-auth.status') ?? '');
-			let uci = cursor();
-			return {
-				status: st || 'unknown',
-				enabled: uci.get('campusauth', 'login', 'enabled') || '0',
-				username: uci.get('campusauth', 'login', 'username') || '',
-				has_password: (uci.get('campusauth', 'login', 'password') || '') != '',
-				interval: uci.get('campusauth', 'login', 'interval') || '90',
-				portal_ip: uci.get('campusauth', 'portal', 'portal_ip') || '10.1.110.2'
-			};
-		}
-	},
-
-	login: {
-		// force one immediate auth attempt (daemon picks it up next cycle,
-		// or we do an inline attempt for instant feedback)
-		call: function(request, args) {
-			let uci = cursor();
-			let userid = uci.get('campusauth', 'login', 'username');
-			let passwd = uci.get('campusauth', 'login', 'password');
-			let portal_ip = uci.get('campusauth', 'portal', 'portal_ip') || '10.1.110.2';
-
-			if (!userid || !passwd)
-				return { code: null, error: '学号或密码未设置' };
-
-			// probe hijack gateway for session params
-			let body = fetch('http://10.0.0.1/');
-			let redirect = match(body ?? '', /http:\/\/[^"']*portal\.do\?[^"']*/);
-			if (!redirect)
-				return { code: null, error: '无法获取认证参数（可能已在线或网关不可达）' };
-
-			let qp = split(substr(redirect[0], index(redirect[0], '?') + 1), '&');
-			let params = {};
-			for (let kv in qp) {
-				let i = index(kv, '=');
-				if (i > 0)
-					params[substr(kv, 0, i)] = substr(kv, i + 1);
+	campusauth: {
+		status: {
+			call: function(request, args) {
+				let st = trim(readfile('/tmp/campus-auth.status') ?? '');
+				let uci = cursor();
+				return {
+					status: st || 'unknown',
+					enabled: uci.get('campusauth', 'login', 'enabled') || '0',
+					username: uci.get('campusauth', 'login', 'username') || '',
+					has_password: (uci.get('campusauth', 'login', 'password') || '') != '',
+					interval: uci.get('campusauth', 'login', 'interval') || '90',
+					portal_ip: uci.get('campusauth', 'portal', 'portal_ip') || '10.1.110.2'
+				};
 			}
+		},
 
-			let url = 'http://' + portal_ip + '/PortalJsonAction.do?' +
-				'wlanuserip=' + (params.wlanuserip ?? '') +
-				'&wlanacname=' + (params.wlanacname ?? '') +
-				'&mac=' + (params.mac ?? '') +
-				'&vlan=' + (params.vlan ?? '') +
-				'&viewStatus=1';
-			let json = fetch(url);
-			if (!json)
-				return { code: null, error: 'PortalJsonAction 无响应' };
+		login: {
+			// force one immediate auth attempt (daemon picks it up next cycle,
+			// or we do an inline attempt for instant feedback)
+			call: function(request, args) {
+				let uci = cursor();
+				let userid = uci.get('campusauth', 'login', 'username');
+				let passwd = uci.get('campusauth', 'login', 'password');
+				let portal_ip = uci.get('campusauth', 'portal', 'portal_ip') || '10.1.110.2';
 
-			let ts = jget(json, 'timestamp');
-			let uuid = jget(json, 'uuid');
-			let acip = jget(json, 'serverip');
-			let userip = jget(json, 'wlanuserip');
-			let acname = jget(json, 'wlanacname');
-			let mac = jget(json, 'mac');
-			let vlan = jget(json, 'vlan');
+				if (!userid || !passwd)
+					return { code: null, error: '学号或密码未设置' };
 
-			if (!ts || !uuid)
-				return { code: null, error: 'portal 配置解析失败' };
+				// probe hijack gateway for session params
+				let body = fetch('http://10.0.0.1/');
+				let redirect = match(body ?? '', /http:\/\/[^"']*portal\.do\?[^"']*/);
+				if (!redirect)
+					return { code: null, error: '无法获取认证参数（可能已在线或网关不可达）' };
 
-			let auth_url = 'http://' + portal_ip + '/quickauth.do?userid=' + enc(userid) +
-				'&passwd=' + enc(passwd) +
-				'&wlanuserip=' + userip + '&wlanacname=' + acname +
-				'&wlanacIp=' + acip + '&ssid=&vlan=' + vlan +
-				'&mac=' + replace(mac ?? '', ':', '%3A') + '&version=0&portalpageid=1' +
-				'&timestamp=' + ts + '&uuid=' + uuid +
-				'&portaltype=0&hostname=&bindCtrlId=';
-			let resp = fetch(auth_url);
-			let code = jget(resp, 'code');
-			let message = jget(resp, 'message');
+				let qp = split(substr(redirect[0], index(redirect[0], '?') + 1), '&');
+				let params = {};
+				for (let kv in qp) {
+					let i = index(kv, '=');
+					if (i > 0)
+						params[substr(kv, 0, i)] = substr(kv, i + 1);
+				}
 
-			return { code: code, message: message };
-		}
-	},
+				let url = 'http://' + portal_ip + '/PortalJsonAction.do?' +
+					'wlanuserip=' + (params.wlanuserip ?? '') +
+					'&wlanacname=' + (params.wlanacname ?? '') +
+					'&mac=' + (params.mac ?? '') +
+					'&vlan=' + (params.vlan ?? '') +
+					'&viewStatus=1';
+				let json = fetch(url);
+				if (!json)
+					return { code: null, error: 'PortalJsonAction 无响应' };
 
-	logout: {
-		call: function(request, args) {
-			let uci = cursor();
-			let portal_ip = uci.get('campusauth', 'portal', 'portal_ip') || '10.1.110.2';
-			let userid = uci.get('campusauth', 'login', 'username') || '';
+				let ts = jget(json, 'timestamp');
+				let uuid = jget(json, 'uuid');
+				let acip = jget(json, 'serverip');
+				let userip = jget(json, 'wlanuserip');
+				let acname = jget(json, 'wlanacname');
+				let mac = jget(json, 'mac');
+				let vlan = jget(json, 'vlan');
 
-			let qp = trim(readfile('/tmp/campus-auth.params') ?? '');
-			let p = {};
-			for (let kv in split(qp, '&')) {
-				let i = index(kv, '=');
-				if (i > 0)
-					p[substr(kv, 0, i)] = substr(kv, i + 1);
+				if (!ts || !uuid)
+					return { code: null, error: 'portal 配置解析失败' };
+
+				let auth_url = 'http://' + portal_ip + '/quickauth.do?userid=' + enc(userid) +
+					'&passwd=' + enc(passwd) +
+					'&wlanuserip=' + userip + '&wlanacname=' + acname +
+					'&wlanacIp=' + acip + '&ssid=&vlan=' + vlan +
+					'&mac=' + replace(mac ?? '', ':', '%3A') + '&version=0&portalpageid=1' +
+					'&timestamp=' + ts + '&uuid=' + uuid +
+					'&portaltype=0&hostname=&bindCtrlId=';
+				let resp = fetch(auth_url);
+				let code = jget(resp, 'code');
+				let message = jget(resp, 'message');
+
+				return { code: code, message: message };
 			}
+		},
 
-			let url = 'http://' + portal_ip + '/quickauthdisconn.do';
-			let cmd = 'uclient-fetch -q -T 8 --user-agent ' + q + UA + q +
-				' --post-data=' + q +
-				'wlanacip=' + (p.wlanacip ?? '10.1.110.3') +
-				'&wlanuserip=' + (p.wlanuserip ?? '') +
-				'&wlanacname=' + (p.wlanacname ?? '') +
-				'&version=0&portaltype=0&userid=' + userid +
-				'&mac=' + (p.mac ?? '') + '&groupId=' + (args?.groupId ?? '2') +
-				q + ' -O - ' + q + url + q + ' 2>/dev/null';
-			let exec = popen(cmd);
-			let out = exec.read('all');
-			exec.close();
-			return { code: jget(out, 'code'), message: jget(out, 'message') };
+		logout: {
+			call: function(request, args) {
+				let uci = cursor();
+				let portal_ip = uci.get('campusauth', 'portal', 'portal_ip') || '10.1.110.2';
+				let userid = uci.get('campusauth', 'login', 'username') || '';
+
+				let qp = trim(readfile('/tmp/campus-auth.params') ?? '');
+				let p = {};
+				for (let kv in split(qp, '&')) {
+					let i = index(kv, '=');
+					if (i > 0)
+						p[substr(kv, 0, i)] = substr(kv, i + 1);
+				}
+
+				let url = 'http://' + portal_ip + '/quickauthdisconn.do';
+				let cmd = 'uclient-fetch -q -T 8 --user-agent ' + q + UA + q +
+					' --post-data=' + q +
+					'wlanacip=' + (p.wlanacip ?? '10.1.110.3') +
+					'&wlanuserip=' + (p.wlanuserip ?? '') +
+					'&wlanacname=' + (p.wlanacname ?? '') +
+					'&version=0&portaltype=0&userid=' + userid +
+					'&mac=' + (p.mac ?? '') + '&groupId=' + (args?.groupId ?? '2') +
+					q + ' -O - ' + q + url + q + ' 2>/dev/null';
+				let exec = popen(cmd);
+				let out = exec.read('all');
+				exec.close();
+				return { code: jget(out, 'code'), message: jget(out, 'message') };
+			}
 		}
 	}
 };
