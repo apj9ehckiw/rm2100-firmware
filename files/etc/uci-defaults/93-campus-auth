@@ -107,18 +107,21 @@ fetch() {
 # probe the hijack gateway to learn our session params:
 # any http:// request returns a JS redirect containing the full portal URL.
 # We use the status API afterwards to get the authoritative portalForm.
-# Returns the portal.do URL on stdout (params included), or empty on no
-# hijack. Sets PROBE_HTTP to 1 when 10.0.0.1 answered at all (distinguishes
-# "answered but no hijack" from "unreachable").
+# Results are passed via globals (NOT stdout - callers must not invoke this
+# inside $(...) or the PROBE_HTTP side effect is lost to the subshell):
+#   PROBE_REDIRECT  portal.do URL when hijacked, else empty
+#   PROBE_HTTP      1 when 10.0.0.1 answered at all (distinguishes
+#                  "answered but no hijack" from "unreachable")
+PROBE_REDIRECT=""
 PROBE_HTTP=0
 probe_params() {
 	local body redirect
 	body=$(fetch "http://10.0.0.1/") || body=""
 	[ -n "$body" ] && PROBE_HTTP=1
 	redirect=$(echo "$body" | grep -o 'http://[^"]*portal\.do[^"]*' | head -1)
+	PROBE_REDIRECT="$redirect"
 	[ -n "$redirect" ] || return 1
-	# extract params from the portal.do URL
-	echo "$redirect"
+	return 0
 }
 
 # internet reachability check (ICMP to a public anycast DNS; IP literal so
@@ -168,7 +171,8 @@ while true; do
 	# is a "no auth needed" signal. Verify with an internet reachability
 	# probe before declaring anything, so a silently-authenticated router
 	# (fresh boot, AUTH_OK still 0) is not misreported as "probe-failed".
-	REDIRECT=$(probe_params)
+	probe_params
+	REDIRECT="$PROBE_REDIRECT"
 	if [ -z "$REDIRECT" ]; then
 		if [ "$AUTH_OK" = "1" ]; then
 			set_status "online(no-hijack) $(date '+%Y-%m-%d %H:%M:%S')"
