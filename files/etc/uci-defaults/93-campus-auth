@@ -124,12 +124,37 @@ probe_params() {
 	return 0
 }
 
-# internet reachability check (ICMP to a public anycast DNS; IP literal so
-# DNS hijacking cannot fake it). Campus networks answer hijack-portal DNS
-# even when unauthenticated, so ICMP is the trustworthy signal here.
+# internet reachability check. A plain ICMP probe is NOT enough: this campus
+# force-disconnects users on weeknights (23:30+) while leaving ICMP to public
+# DNS reachable - ping says "online" while HTTP is dead. Probe the HTTP layer
+# instead via generate_204 endpoints (two fallback probes, both China-side):
+#   - real online       -> HTTP 204, empty body, exit 0
+#   - unauthenticated   -> hijacked to the portal page (body has portal.do)
+#   - force-disconnected-> connect timeout/failure, non-zero exit
+# Globals (same subshell caveat as probe_params):
+#   NET_HIJACK  1 when the response looked like the portal hijack page
+NET_HIJACK=0
 check_online() {
-	ping -c 1 -W 3 223.5.5.5 >/dev/null 2>&1 && return 0
-	ping -c 1 -W 3 119.29.29.29 >/dev/null 2>&1 && return 0
+	NET_HIJACK=0
+	local body rc
+	for url in "http://204.ustclug.org/generate_204" \
+	           "http://connect.rom.miui.com/generate_204"; do
+		body=$(uclient-fetch -q -T 8 --user-agent "$UA" -O - "$url" 2>/dev/null)
+		rc=$?
+		if [ $rc -eq 0 ]; then
+			# got an HTTP response. A hijacking AC follows the redirect
+			# chain and lands on the portal page (uclient-fetch follows
+			# redirects by itself, exit 0); the portal JS contains
+			# portal.do. A clean 204 has an empty body.
+			if echo "$body" | grep -q 'portal\.do'; then
+				NET_HIJACK=1
+				return 1
+			fi
+			return 0
+		fi
+		# rc!=0: connection-level failure (4) or non-2xx (8). Both can also
+		# mean "this single endpoint is down" - try the next probe.
+	done
 	return 1
 }
 
@@ -168,20 +193,39 @@ while true; do
 	# The hijack gateway only answers with a portal.do redirect while the
 	# session is UNAUTHENTICATED. Once online (e.g. MAC-based silent auth:
 	# same WAN MAC as last session), 10.0.0.1 stops hijacking - which itself
-	# is a "no auth needed" signal. Verify with an internet reachability
-	# probe before declaring anything, so a silently-authenticated router
-	# (fresh boot, AUTH_OK still 0) is not misreported as "probe-failed".
+	# is a "no auth needed" signal. Verify with an HTTP reachability probe
+	# before declaring anything, so a silently-authenticated router (fresh
+	# boot, AUTH_OK still 0) is not misreported as "probe-failed".
+	# NOTE: check_online runs EVERY cycle (also when AUTH_OK=1): this campus
+	# force-disconnects on weeknights 23:30+ while ICMP still answers, so a
+	# ping-based check would show "online" through a dead HTTP layer.
 	probe_params
 	REDIRECT="$PROBE_REDIRECT"
 	if [ -z "$REDIRECT" ]; then
-		if [ "$AUTH_OK" = "1" ]; then
+		if [ "$AUTH_OK" = "1" ] && check_online; then
+			# authenticated earlier and HTTP layer still works: stay online.
+			# check_online each cycle (not just on first detection) - the
+			# campus force-disconnects on weeknights while ICMP stays up,
+			# which a ping-only check would misreport as online.
 			set_status "online(no-hijack) $(date '+%Y-%m-%d %H:%M:%S')"
-		elif check_online; then
+		elif [ "$AUTH_OK" != "1" ] && check_online; then
 			# hijack gone AND internet reachable: silently authenticated
 			# (MAC auth) or otherwise exempted - nothing to do
 			AUTH_OK=1; ONLINE_STAMP=$(date +%s)
 			set_status "online(mac-auth/免认证) $(date '+%Y-%m-%d %H:%M:%S')"
 			log "no hijack but internet reachable - already authenticated (mac-auth?)"
+		elif [ "$NET_HIJACK" = "1" ]; then
+			# check_online saw the portal page without a hijack redirect
+			# from 10.0.0.1 - the AC is mid-transition; retry next cycle
+			set_status "portal-transition（检测到劫持页，等待下轮探测） $(date '+%Y-%m-%d %H:%M:%S')"
+		elif [ "$AUTH_OK" = "1" ]; then
+			# was online, HTTP layer now dead while ICMP may still answer:
+			# weeknight force-disconnect (23:30+) looks exactly like this.
+			# Reset AUTH_OK so we re-run the full auth path the moment the
+			# AC starts hijacking again (i.e. network is back).
+			AUTH_OK=0
+			set_status "disconnected（HTTP 不通，疑似停机断网；恢复后自动重连） $(date '+%Y-%m-%d %H:%M:%S')"
+			log "online->disconnected: HTTP layer unreachable (force-disconnect window?)"
 		elif [ "$PROBE_HTTP" = "1" ]; then
 			# gateway answered but no portal.do redirect and no internet:
 			# portal moved or hijack format changed - worth a log line
