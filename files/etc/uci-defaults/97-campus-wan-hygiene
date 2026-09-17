@@ -1,10 +1,13 @@
 #!/bin/sh
-# campus-fix v2.1: WAN-side passive fingerprint hygiene.
+# campus-fix v2.6: WAN-side passive fingerprint hygiene.
 #
 # 1) ip-sysctl: silence the stack-tell behaviors that passive OS classifiers
 #    (p0f-style) look for on the single "host" the campus sees.
-# 2) WAN MAC locally administered: the stock Xiaomi OUI on a "Windows PC"
-#    hostname is itself an anomaly signal.
+# 2) WAN MAC policy: KEEP THE FACTORY MAC by default (v2.x used to generate a
+#    random locally-administered MAC on first boot; changed by user request -
+#    a stable MAC avoids portal re-auth, and campus auth binds to it anyway).
+#    The factory Xiaomi OUI is a weak signal; if the campus flags it, use the
+#    LuCI "校园网 MAC" page to clone a PC MAC or rotate.
 
 # --- TCP/IP stack hygiene (applies to forwarded + router-origin traffic)
 sysctl -qw net.ipv4.tcp_timestamps=1
@@ -12,37 +15,25 @@ sysctl -qw net.ipv4.tcp_window_scaling=1
 sysctl -qw net.ipv4.icmp_echo_ignore_broadcasts=1
 sysctl -qw net.ipv4.conf.all.rp_filter=1
 
-# --- WAN MAC: locally-administered, keeps OUI from screaming "Xiaomi router"
-# Three modes (managed via /etc/campus-fix-macmode, LuCI page "Campus MAC"):
-#   "custom"  - user set a MAC in LuCI; /etc/campus-fix-wanmac holds it
-#   "factory" - user wants the factory WAN MAC; no uci override
-#   (absent)  - first boot: generate + persist a random locally-admin MAC
+# --- WAN MAC: factory default, no first-boot randomization anymore.
+# Mode file is kept for the LuCI page (custom/factory), but on a fresh flash
+# we deliberately do nothing - OpenWrt's own MAC computation applies.
 MODEFILE="/etc/campus-fix-macmode"
 MACFILE="/etc/campus-fix-wanmac"
 MODE=$(cat "$MODEFILE" 2>/dev/null)
+
 if [ "$MODE" = "factory" ]; then
-  # remove any override; factory MAC comes from OpenWrt's default computation
+  # user explicitly reset to factory: remove any override
   uci -q delete network.wan.macaddr
   uci -q commit network
-  exit 0
+elif [ "$MODE" = "custom" ] && [ -s "$MACFILE" ]; then
+  # user set a custom MAC via LuCI: apply it (idempotent across reboots)
+  CMAC=$(sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1:\2:\3:\4:\5:\6/' "$MACFILE")
+  if [ -n "$CMAC" ]; then
+    uci -q set network.wan.macaddr="$CMAC"
+    uci -q commit network
+  fi
 fi
-if [ ! -s "$MACFILE" ]; then
-  # 6 random bytes as 12 hex chars. hexdump IS in the OpenWrt busybox
-  # applet set; od is NOT (do not "fix" this back to od).
-  RAND=$(hexdump -vn6 -e '6/1 "%02x"' /dev/urandom)
-  case "$RAND" in
-    [0-9a-f]*[0-9a-f]) : ;;
-    *) RAND="a1b2c3d4e5f6" ;;
-  esac
-  # first byte: force locally-administered unicast (bit1 set, bit0 clear)
-  B1=$(printf '%02x' $(( (0x$(printf '%s' "$RAND" | cut -c1-2) | 0x02) & 0xFE )))
-  echo "${B1}$(printf '%s' "$RAND" | cut -c3-12)" > "$MACFILE"
-fi
-CMAC=$(sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1:\2:\3:\4:\5:\6/' "$MACFILE")
-if [ -n "$CMAC" ]; then
-  uci -q set network.wan.macaddr="$CMAC"
-  uci -q commit network
-fi
-[ -s "$MODEFILE" ] || echo custom > "$MODEFILE"
+# absent mode file (fresh flash): no action at all - factory MAC stays.
 
 exit 0

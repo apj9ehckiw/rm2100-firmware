@@ -1,17 +1,21 @@
 #!/bin/sh
-# campus-fix v2.3: WAN MAC management UI (ucode LuCI page).
+# campus-fix v2.6: WAN MAC management UI (ucode LuCI page).
 #
-# The firmware already randomizes the WAN MAC on first boot
-# (97-campus-wan-hygiene, persisted in /etc/campus-fix-wanmac and applied
-# via uci network.wan.macaddr). This adds a LuCI page to VIEW and SET it
-# manually, so you can clone your PC's MAC or rotate on demand without ssh.
+# View and SET the WAN MAC manually - clone your PC's MAC or rotate on
+# demand without ssh. The factory MAC is kept by default (no first-boot
+# randomization since v2.6); any custom MAC set here is persisted in
+# /etc/campus-fix-wanmac and re-applied by 97-campus-wan-hygiene on boot.
 #
-# Page: LuCI -> Network -> Campus MAC
+# Page: LuCI -> Network -> Campus MAC (校园网 MAC)
 # Implemented with the ucode-based LuCI runtime shipped in OpenWrt 24.10
 # (luci-base has no Lua interpreter; Lua CBI pages require luci-compat,
 # which is NOT installed). Uses menu.d JSON + rpcd ucode backend only.
 #
 # NOTE on random bytes: OpenWrt busybox has hexdump but NOT od.
+# NOTE: rpcd only scans /usr/share/rpcd/ucode at STARTUP - this script runs
+# during first boot AFTER rpcd started, so we must restart rpcd for the
+# plugin to register. Restarting rpcd during uci-defaults is safe (no LuCI
+# sessions exist yet at that point).
 
 # --- 1) rpcd plugin: expose live MAC read + random MAC generation
 mkdir -p /usr/share/rpcd/ucode
@@ -24,30 +28,43 @@ import { cursor } from 'uci';
 
 const q = "'";
 
+function wan_device() {
+	let uci = cursor();
+	let dev = uci.get('network', 'wan', 'device');
+
+	// also consider an explicit macaddr override device section; ifstatus
+	// gives the runtime truth (l3_device), use it as fallback
+	if (!dev) {
+		let p = popen('ifstatus wan 2>/dev/null');
+		let out = p?.read('all');
+		p?.close();
+
+		let m = out ? match(out, /"l3_device"\s*:\s*"([^"]+)"/) : null;
+		if (!m && out)
+			m = match(out, /"device"\s*:\s*"([^"]+)"/);
+		if (m)
+			dev = m[1];
+	}
+
+	return dev;
+}
+
 return {
 	livemac: {
 		call: function(request, args) {
-			// resolve the wan logical interface to its device, then read MAC
-			let uci = cursor();
-			let dev = uci.get('network', 'wan', 'device');
-
-			if (!dev) {
-				// DSA 'wan' or legacy eth0.2: fall back to ifstatus
-				let p = popen('ifstatus wan 2>/dev/null');
-				let out = p.read('all');
-				p.close();
-
-				if (out) {
-					let m = match(out, /"device":"([^"]+)"/);
-					if (m)
-						dev = m[1];
-				}
-			}
+			let dev = wan_device();
 
 			if (!dev)
 				return { mac: null, error: 'no wan device' };
 
 			let mac = trim(readfile(`/sys/class/net/${dev}/address`) ?? '');
+
+			// fallback: the configured uci override (matches what will
+			// apply on next ifup even if the device is down right now)
+			if (!mac) {
+				let uci = cursor();
+				mac = uci.get('network', 'wan', 'macaddr') ?? '';
+			}
 
 			return { mac: mac || null, device: dev };
 		}
@@ -143,7 +160,7 @@ return view.extend({
 		var m, s, o;
 
 		m = new form.Map('network', _('校园网 MAC'),
-			_('路由器在校园网侧呈现的 MAC 地址。首次启动时已生成随机本地管理 MAC。') +
+			_('路由器在校园网侧呈现的 MAC 地址。默认使用出厂 MAC；也可克隆电脑网卡 MAC 或按需换新。') +
 			_('<br /><br /><b>格式：</b>6 组冒号分隔的十六进制，如 <code>12:34:56:78:9A:BC</code>。') +
 			_('留空保存即可恢复出厂 WAN MAC。') +
 			_('<br /><br /><b>生效方式：</b><code>ifup wan</code> 或重启。') +
@@ -152,7 +169,7 @@ return view.extend({
 		s = m.section(form.NamedSection, 'wan', 'interface', _('WAN 接口'));
 
 		o = s.option(form.Value, 'macaddr', _('WAN MAC 地址'),
-			_('WAN 口当前实际 MAC') + ': <code>' + (live ? (live.mac || _('未知')) : _('未知')) + '</code>');
+			_('WAN 口当前实际 MAC') + ': <code>' + ((live && live.mac) ? live.mac : _('未知')) + '</code>');
 		o.rmempty = true;
 		o.datatype = 'macaddr';
 
@@ -180,5 +197,12 @@ JSEOF
 
 # reload luci caches so the page appears without manual flush
 rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* 2>/dev/null
+
+# rpcd scans /usr/share/rpcd/ucode/ only at startup; it is already running
+# during first-boot uci-defaults, so the campusmac plugin written above would
+# NOT be registered until the next reboot - the LuCI page would show
+# "未知" (the ubus call fails, JS falls back to {}). Restart rpcd now to
+# register the plugin immediately. Safe at this point: no LuCI sessions yet.
+/etc/init.d/rpcd restart 2>/dev/null || killall -HUP rpcd 2>/dev/null
 
 exit 0

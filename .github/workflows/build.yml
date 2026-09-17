@@ -14,7 +14,7 @@ on:
       fw_version:
         description: "Firmware version stamp (written to /etc/campus-fix-version and artifact name)"
         required: false
-        default: "2.5.0"
+        default: "2.6.0"
 
 env:
   PROFILE: xiaomi_redmi-router-ac2100
@@ -52,7 +52,7 @@ jobs:
           mkdir -p ib/files
           cp -r files/* ib/files/
           # stamp the firmware version into the overlay
-          FWV="${{ github.event.inputs.fw_version || '2.5.0' }}"
+          FWV="${{ github.event.inputs.fw_version || '2.6.0' }}"
           echo "$FWV" > ib/files/etc/campus-fix-version
           sed -i "s|^echo \".*\" > /etc/campus-fix-version|echo \"$FWV\" > /etc/campus-fix-version|"             ib/files/etc/uci-defaults/99-campus-fix-banner
           echo "firmware version: $FWV"
@@ -113,7 +113,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: rm2100-firmware-v${{ github.event.inputs.fw_version || '2.5.0' }}-openwrt-${{ github.event.inputs.openwrt_version || '24.10.2' }}
+          name: rm2100-firmware-v${{ github.event.inputs.fw_version || '2.6.0' }}-openwrt-${{ github.event.inputs.openwrt_version || '24.10.2' }}
           path: |
             ib/bin/targets/*/*/openwrt-*-xiaomi_redmi-router-ac2100-squashfs-kernel1.bin
             ib/bin/targets/*/*/openwrt-*-xiaomi_redmi-router-ac2100-squashfs-rootfs0.bin
