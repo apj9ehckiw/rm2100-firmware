@@ -110,15 +110,30 @@ jobs:
       - name: List artifacts
         run: find ib/bin/targets -type f \( -name "*.bin" -o -name "*.manifest" -o -name "sha256sums" \) -exec ls -lh {} \;
 
+      - name: Rename artifacts with firmware version
+        run: |
+          # campus-fix vX.Y.Z 前缀：下载下来一眼可辨版本（breed 刷机界面
+          # 只显示文件名，原名一串 openwrt-24.10.2-ramips-... 容易刷错包）
+          FWV="${{ github.event.inputs.fw_version || '2.6.6' }}"
+          cd ib/bin/targets/*/*/
+          for f in openwrt-*-xiaomi_redmi-router-ac2100-*.bin \
+                   openwrt-*-xiaomi_redmi-router-ac2100.manifest; do
+            [ -f "$f" ] || continue
+            mv "$f" "campus-fix-v${FWV}-${f}"
+          done
+          # sha256sums 原条目引用旧文件名，对新名重生成
+          sha256sum campus-fix-v*.bin > sha256sums
+          cat sha256sums
+          ls -lh campus-fix-v*
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: rm2100-firmware-v${{ github.event.inputs.fw_version || '2.6.6' }}-openwrt-${{ github.event.inputs.openwrt_version || '24.10.2' }}
           path: |
-            ib/bin/targets/*/*/openwrt-*-xiaomi_redmi-router-ac2100-squashfs-kernel1.bin
-            ib/bin/targets/*/*/openwrt-*-xiaomi_redmi-router-ac2100-squashfs-rootfs0.bin
-            ib/bin/targets/*/*/openwrt-*-xiaomi_redmi-router-ac2100-squashfs-sysupgrade.bin
-            ib/bin/targets/*/*/openwrt-*-xiaomi_redmi-router-ac2100-initramfs-kernel.bin
-            ib/bin/targets/*/*/*.manifest
+            ib/bin/targets/*/*/campus-fix-v*-xiaomi_redmi-router-ac2100-squashfs-kernel1.bin
+            ib/bin/targets/*/*/campus-fix-v*-xiaomi_redmi-router-ac2100-squashfs-rootfs0.bin
+            ib/bin/targets/*/*/campus-fix-v*-xiaomi_redmi-router-ac2100-squashfs-sysupgrade.bin
+            ib/bin/targets/*/*/campus-fix-v*-xiaomi_redmi-router-ac2100.manifest
             ib/bin/targets/*/*/sha256sums
           retention-days: 30
