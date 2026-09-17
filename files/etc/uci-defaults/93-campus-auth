@@ -96,8 +96,47 @@ read_config() {
 	ENABLED=$(uci -q get campusauth.login.enabled || echo "0")
 	USERID=$(uci -q get campusauth.login.username)
 	PASSWD=$(uci -q get campusauth.login.password)
+	ACTIVE_START=$(uci -q get campusauth.login.active_start)
+	ACTIVE_END=$(uci -q get campusauth.login.active_end)
 }
 read_config
+
+# Is the current wall-clock time inside the active window?
+#   empty start/end        -> always active (default)
+#   start < end (07:00-23:30) -> same-day window
+#   start > end (22:00-06:00) -> overnight window (wraps midnight)
+# HH:MM with leading zeros compares correctly as a plain string.
+# Any malformed value -> treat as always-active (fail open: auth keeps
+# working when someone typos the config; a fail-closed daemon would sit
+# silently through a perfectly good network window).
+in_active_window() {
+	local now start end
+	now=$(date '+%H:%M')
+	start=${ACTIVE_START:-}
+	end=${ACTIVE_END:-}
+	[ -z "$start" ] || [ -z "$end" ] && return 0
+	# validate HH:MM (busybox date always emits valid HH:MM; config might not)
+	echo "$start$end" | grep -q '[^0-9:]' && return 0
+	case "$start:$end" in
+		[0-2][0-9]:[0-5][0-9]:[0-2][0-9]:[0-5][0-9]) ;;
+		*) return 0 ;;
+	esac
+	if [ "$start" = "$end" ]; then
+		return 0
+	fi
+	# test(1) has no >= operator; "not less-than" is the portable form
+	# (verified against busybox ash AND bash: `\>=` silently errors).
+	if [ "$start" \< "$end" ]; then
+		# same-day window: start <= now < end
+		[ "$now" \< "$end" ] && [ ! "$now" \< "$start" ] && return 0
+		return 1
+	else
+		# overnight window (wraps midnight): now >= start OR now < end
+		[ ! "$now" \< "$start" ] && return 0
+		[ "$now" \< "$end" ] && return 0
+		return 1
+	fi
+}
 
 # fetch url -> stdout (uclient-fetch; wget is its alias on OpenWrt)
 fetch() {
@@ -195,6 +234,17 @@ while true; do
 
 	if [ "$ENABLED" != "1" ]; then
 		set_status "disabled（未启用自动认证） $(date '+%Y-%m-%d %H:%M:%S')"
+		sleep "$INTERVAL"
+		continue
+	fi
+
+	# active window: pause all probing/login outside the configured
+	# hours (e.g. 07:00-23:30 so the daemon sleeps through the campus
+	# force-disconnect window instead of retrying all night). Keep
+	# AUTH_OK as-is: re-entering the window re-runs the full state
+	# machine anyway (check_online / hijack paths both handle it).
+	if ! in_active_window; then
+		set_status "paused（超出运行时段 ${ACTIVE_START}-${ACTIVE_END}，暂停探测） $(date '+%Y-%m-%d %H:%M:%S')"
 		sleep "$INTERVAL"
 		continue
 	fi
@@ -329,6 +379,8 @@ config login 'login'
 	option username ''
 	option password ''
 	option interval '90'
+	option active_start ''
+	option active_end ''
 
 config portal 'portal'
 	option portal_ip '10.1.110.2'
@@ -402,6 +454,8 @@ return {
 					username: uci.get('campusauth', 'login', 'username') || '',
 					has_password: (uci.get('campusauth', 'login', 'password') || '') != '',
 					interval: uci.get('campusauth', 'login', 'interval') || '90',
+					active_start: uci.get('campusauth', 'login', 'active_start') || '',
+					active_end: uci.get('campusauth', 'login', 'active_end') || '',
 					portal_ip: uci.get('campusauth', 'portal', 'portal_ip') || '10.1.110.2'
 				};
 			}
@@ -574,6 +628,17 @@ var callLogout = rpc.declare({
 	expect: {}
 });
 
+// HH:MM validation. NOTE: LuCI 24.10 has no 'time' datatype (only
+// 'timehhmmss'); an unknown datatype name makes Validator.compile throw
+// SyntaxError and kills the whole form, so validate via o.validate.
+function validateHHMM(value) {
+	if (value == null || value == '')
+		return true;
+	if (!/^(2[0-3]|[01][0-9]):[0-5][0-9]$/.test(value))
+		return _('格式须为 HH:MM，如 07:00 或 23:30');
+	return true;
+}
+
 return view.extend({
 	load: function() {
 		return L.resolveDefault(callStatus(), {});
@@ -607,6 +672,18 @@ return view.extend({
 		o.rmempty = false;
 		o.datatype = 'range(30, 3600)';
 		o.placeholder = '90';
+
+		o = s.option(form.Value, 'active_start', _('运行开始时间'),
+			_('自动认证的每日运行起始时间（HH:MM，如 07:00）。留空 = 全天运行。'));
+		o.rmempty = true;
+		o.placeholder = '07:00';
+		o.validate = validateHHMM;
+
+		o = s.option(form.Value, 'active_end', _('运行结束时间'),
+			_('自动认证的每日运行结束时间（HH:MM，如 23:30）。开始晚于结束时视为跨午夜时段（如 22:00-06:00）。留空 = 全天运行。'));
+		o.rmempty = true;
+		o.placeholder = '23:30';
+		o.validate = validateHHMM;
 
 		s = m.section(form.NamedSection, 'portal', 'portal', _('Portal 服务器'));
 
