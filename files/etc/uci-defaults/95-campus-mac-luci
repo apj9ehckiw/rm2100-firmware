@@ -23,7 +23,7 @@ cat > /usr/share/rpcd/ucode/campusmac <<'UCEOF'
 // campus-fix rpcd backend: read live WAN MAC, generate random MAC
 'use strict';
 
-import { readfile, popen, pclose } from 'fs';
+import { readfile, popen } from 'fs';
 import { cursor } from 'uci';
 
 const q = "'";

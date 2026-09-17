@@ -239,7 +239,9 @@ function fetch(url) {
 }
 
 function jget(json, key) {
-	let m = match(json, new RegExp('"' + key + '"\\s*:\\s*("([^"]*)"|[0-9]+|true|false|null)'));
+	// ucode has no `new RegExp` - use the regexp() builtin instead
+	let re = regexp('"' + key + '"\\s*:\\s*("([^"]*)"|[0-9]+|true|false|null)');
+	let m = match(json, re);
 	return m ? (m[2] ?? m[1]) : null;
 }
 
