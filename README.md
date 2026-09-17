@@ -3,7 +3,7 @@
 红米 RM AC2100（MediaTek MT7621A，128MB RAM / 16MB flash）专用 OpenWrt 固件，
 内置**校园网多设备检测规避**套件，通过 GitHub Actions 云端构建，本机无需 Linux 环境。
 
-**当前固件版本：v2.3.1**（刷入后 `cat /etc/campus-fix-version` 查询）
+**当前固件版本：v2.4.0**（刷入后 `cat /etc/campus-fix-version` 查询）
 
 ## 功能总览
 
@@ -45,6 +45,14 @@
   重新登录**（认证会话绑定 MAC）
 - 三种模式（custom / factory / 首刷随机）持久化，重启不丢
 
+### LuCI 主题与语言
+
+- **主题**：Argon（v2.4.7，第三方 [jerrykuku/luci-theme-argon](https://github.com/jerrykuku/luci-theme-argon)，
+  构建时从 GitHub Releases 拉取 `_all` 包——官方 24.10 feed 没有收录此主题）
+- **语言**：默认简体中文（`luci.main.lang='zh_cn'`，浏览器语言优先级失效；
+  想跟随浏览器就改回 `auto`）
+- `include_luci=false` 构建时不含主题与语言包（纯 CLI）
+
 ### 刻意不做的（及理由）
 
 - **不封 DoH**：走 443/TCP 与正常流量无法区分，误伤太大；QUIC 已封，
@@ -55,7 +63,7 @@
 ## 使用方法
 
 1. **构建**：本仓库已配好 Actions。进 **Actions → Build RM AC2100 OpenWrt
-   firmware → Run workflow**，默认参数（24.10.2 + LuCI + v2.3.1）直接 Run，
+   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.4.0）直接 Run，
    约 3-5 分钟出包。可调输入：
    - `openwrt_version`：OpenWrt 底包版本
    - `include_luci`：是否带 LuCI（false = 纯 CLI，省内存）
@@ -88,7 +96,7 @@
 ## 首次进系统检查清单
 
 ```
-cat /etc/campus-fix-version        # 应显示 2.3.1
+cat /etc/campus-fix-version        # 应显示 2.4.0
 nft list chain inet fw4 campus_ttl_postrouting     # counter 在涨 = TTL 归一生效
 nft list chain inet fw4 campus_quic_block          # drop 在涨 = 有客户端试图 QUIC
 nft list chain inet fw4 campus_leak_block          # 发现协议封锁生效
@@ -153,3 +161,4 @@ files/
 | v2.2.0 | + LuCI「Campus MAC」页面（查/设/克隆/轮换/复原），MAC 三模式持久化 |
 | v2.3.0 | 修复：IP-ID 规则 `hash`→`jhash`（v2.0 起语法错误导致 fw4 整表加载失败、首刷断网）；MAC 随机化 `od`→`hexdump`（busybox 无 od，原 fallback 会让所有设备同 MAC）；Campus MAC 页面重写为 ucode 实现（24.10 luci-base 无 Lua 运行时，原 Lua CBI 页面静默失效）；NTP interface list→option；CI 增加 nft 语法校验步骤 |
 | v2.3.1 | TTL/hoplimit 默认基准 64 → 128（Windows 指纹；校园认证通常面向 PC，128 亦是更保守的默认） |
+| v2.4.0 | + LuCI Argon 主题（第三方包，构建时自动拉取）+ 界面默认简体中文 |

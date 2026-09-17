@@ -1,0 +1,16 @@
+#!/bin/sh
+# campus-fix v2.4: default LuCI language = Simplified Chinese, theme = Argon.
+#
+# Language: 'auto' makes LuCI follow the browser's Accept-Language header.
+# Forcing zh_cn gives a consistent Chinese UI regardless of browser locale
+# (set 'auto' below if you prefer browser-following behavior).
+# The argon theme package's own uci-defaults (30_luci-theme-argon) sets
+# mediaurlbase; this script only enforces it in case of ordering quirks.
+
+uci -q batch <<EOF
+	set luci.main.lang='zh_cn'
+	set luci.main.mediaurlbase='/luci-static/argon'
+	commit luci
+EOF
+
+exit 0

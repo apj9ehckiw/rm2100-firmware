@@ -14,7 +14,7 @@ on:
       fw_version:
         description: "Firmware version stamp (written to /etc/campus-fix-version and artifact name)"
         required: false
-        default: "2.3.1"
+        default: "2.4.0"
 
 env:
   PROFILE: xiaomi_redmi-router-ac2100
@@ -52,10 +52,21 @@ jobs:
           mkdir -p ib/files
           cp -r files/* ib/files/
           # stamp the firmware version into the overlay
-          FWV="${{ github.event.inputs.fw_version || '2.3.1' }}"
+          FWV="${{ github.event.inputs.fw_version || '2.4.0' }}"
           echo "$FWV" > ib/files/etc/campus-fix-version
           sed -i "s|^echo \".*\" > /etc/campus-fix-version|echo \"$FWV\" > /etc/campus-fix-version|"             ib/files/etc/uci-defaults/99-campus-fix-banner
           echo "firmware version: $FWV"
+
+      - name: Fetch third-party packages (luci-theme-argon)
+        run: |
+          # Argon is not in the official 24.10 luci feed (only bootstrap/
+          # material/openwrt are). Pull the release ipk from upstream; it is
+          # arch-independent (_all) and ucode-based, verified compatible with
+          # 24.10 LuCI. Place it where ImageBuilder picks up local packages.
+          mkdir -p ib/packages/local
+          curl -fL --retry 3 -o ib/packages/local/luci-theme-argon_2.4.7_all.ipk \
+            "https://github.com/jerrykuku/luci-theme-argon/releases/download/v2.4.7/luci-theme-argon_2.4.7_all.ipk"
+          ls -la ib/packages/local/
 
       - name: Validate custom nftables rules
         run: |
@@ -84,6 +95,11 @@ jobs:
           PKGS=""
           if [ "${{ github.event.inputs.include_luci || 'true' }}" = "true" ]; then
             PKGS="luci"
+            # Argon theme (from local packages/ dir) + Simplified Chinese
+            # UI. base-zh-cn covers luci-base/mod-*; the other two cover
+            # the bundled apps. luci-i18n auto-lang: uci-defaults below
+            # sets zh-cn as default.
+            PKGS="$PKGS luci-theme-argon luci-i18n-base-zh-cn luci-i18n-firewall-zh-cn luci-i18n-package-manager-zh-cn"
           fi
           PKGS="$PKGS kmod-ipt-nat ip6tables-nft iptables-nft"
           make image \
@@ -97,7 +113,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: rm2100-firmware-v${{ github.event.inputs.fw_version || '2.3.1' }}-openwrt-${{ github.event.inputs.openwrt_version || '24.10.2' }}
+          name: rm2100-firmware-v${{ github.event.inputs.fw_version || '2.4.0' }}-openwrt-${{ github.event.inputs.openwrt_version || '24.10.2' }}
           path: |
             ib/bin/targets/*/*/openwrt-*-xiaomi_redmi-router-ac2100-squashfs-kernel1.bin
             ib/bin/targets/*/*/openwrt-*-xiaomi_redmi-router-ac2100-squashfs-rootfs0.bin
