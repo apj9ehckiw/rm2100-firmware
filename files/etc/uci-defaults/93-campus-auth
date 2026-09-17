@@ -79,16 +79,25 @@ cat > /usr/bin/campus-auth <<'DAEMONEOF'
 #!/bin/sh
 # campus portal auto-login daemon (procd supervised)
 # Writes state to /tmp/campus-auth.status for the LuCI page.
+#
+# Config (enabled/interval/credentials/portal_ip) is re-read EVERY cycle so
+# LuCI edits take effect even if the procd reload trigger chain fails.
 
-PORTAL_IP=$(uci -q get campusauth.portal.portal_ip || echo "10.1.110.2")
-INTERVAL=$(uci -q get campusauth.login.interval || echo "90")
-USERID=$(uci -q get campusauth.login.username)
-PASSWD=$(uci -q get campusauth.login.password)
 STATUS_FILE=/tmp/campus-auth.status
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
 log() { logger -t campus-auth "$1"; }
 set_status() { echo "$1" > "$STATUS_FILE"; }
+
+# refresh uci-derived settings (called each loop iteration)
+read_config() {
+	PORTAL_IP=$(uci -q get campusauth.portal.portal_ip || echo "10.1.110.2")
+	INTERVAL=$(uci -q get campusauth.login.interval || echo "90")
+	ENABLED=$(uci -q get campusauth.login.enabled || echo "0")
+	USERID=$(uci -q get campusauth.login.username)
+	PASSWD=$(uci -q get campusauth.login.password)
+}
+read_config
 
 # fetch url -> stdout (uclient-fetch; wget is its alias on OpenWrt)
 fetch() {
@@ -128,6 +137,16 @@ AUTH_OK=0
 ONLINE_STAMP=0
 
 while true; do
+	# re-read settings each cycle: LuCI edits apply within one interval even
+	# if the procd reload trigger chain fails for whatever reason
+	read_config
+
+	if [ "$ENABLED" != "1" ]; then
+		set_status "disabled（未启用自动认证） $(date '+%Y-%m-%d %H:%M:%S')"
+		sleep "$INTERVAL"
+		continue
+	fi
+
 	# --- gather session params ----------------------------------------
 	# The hijack gateway only answers with a portal.do redirect while the
 	# session is UNAUTHENTICATED. Once online, 10.0.0.1 stops hijacking
@@ -158,7 +177,12 @@ while true; do
 		MAC=$(echo "$JSON" | grep -o '"mac"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*: *"//;s/"//')
 		VLAN=$(echo "$JSON" | grep -o '"vlan"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*: *"//;s/"//')
 
-		# --- try login ------------------------------------------------
+	# --- try login ------------------------------------------------
+		if [ -z "$USERID" ] || [ -z "$PASSWD" ]; then
+			set_status "no-credentials（学号或密码未设置） $(date '+%Y-%m-%d %H:%M:%S')"
+			sleep "$INTERVAL"
+			continue
+		fi
 		MAC_ENC=$(echo "$MAC" | sed 's/:/%3A/g')
 		USERID_ENC=$(urlencode "$USERID")
 		PASSWD_ENC=$(urlencode "$PASSWD")
@@ -257,8 +281,26 @@ return {
 			call: function(request, args) {
 				let st = trim(readfile('/tmp/campus-auth.status') ?? '');
 				let uci = cursor();
+
+				// is the daemon process actually up? procd writes the
+				// instance pidfile; a shell script's comm is "sh", so
+				// pgrep -x would never match - check the pidfile instead.
+				let running = false;
+				let pid = trim(readfile('/var/run/campus-auth.pid') ?? '');
+				if (pid) {
+					let p = popen('kill -0 ' + pid + ' 2>/dev/null && echo up');
+					if (p) {
+						running = trim(p.read('all') ?? '') == 'up';
+						p.close();
+					}
+				}
+
+				if (!running && st == '')
+					st = '未运行（未启用自动认证）';
+
 				return {
 					status: st || 'unknown',
+					running: running,
 					enabled: uci.get('campusauth', 'login', 'enabled') || '0',
 					username: uci.get('campusauth', 'login', 'username') || '',
 					has_password: (uci.get('campusauth', 'login', 'password') || '') != '',
@@ -445,7 +487,9 @@ return view.extend({
 
 		m = new form.Map('campusauth', _('校园网认证'),
 			_('校园网 Portal 自动认证（抓包逆向实现）。保存凭据并启用后，后台服务会自动登录并掉线重连。') +
-			_('<br /><br />当前状态：<code>%s</code>').format(st.status || '未知'));
+			_('<br /><br />当前状态：<code>%s</code>（后台服务：%s）')
+				.format(st.status || '未知',
+					(st.running === true) ? _('运行中') : _('未运行')));
 
 		s = m.section(form.NamedSection, 'login', 'login', _('认证设置'));
 
@@ -513,7 +557,30 @@ return view.extend({
 });
 JSEOF
 
-# enable on boot only if user later sets enabled=1 (uci default is 0)
+# enable the service on boot: start_service() no-ops while
+# campusauth.login.enabled != 1, so enabling the init script up front is
+# safe - the daemon springs to life as soon as the user ticks the checkbox.
+/etc/init.d/campus-auth enable
+
+# Also run "start" ONCE here: boot(START=10) runs uci-defaults long before
+# S99campus-auth, and until the init's first procd "start" the service
+# entry (with its procd_add_reload_trigger) is NOT registered with procd.
+# Without this, the very first "保存并应用" after flashing would commit
+# campusauth but nothing would start the daemon. With an empty instance
+# (enabled=0) this start is a no-op besides registering entry + triggers.
+/etc/init.d/campus-auth start 2>/dev/null
+
+# ucitrack: LuCI "保存并应用" on the campusauth config reloads the daemon
+# (writes /usr/share/ucitrack/campusauth.json; ucitrack initscript picks it
+# up on next boot, and LuCI's apply loop reloads the init right away).
+mkdir -p /usr/share/ucitrack
+cat > /usr/share/ucitrack/campusauth.json <<'UTEOF'
+{
+	"config": "campusauth",
+	"init": "campus-auth"
+}
+UTEOF
+
 rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* 2>/dev/null
 
 exit 0

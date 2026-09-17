@@ -150,13 +150,16 @@ cat > /www/luci-static/resources/view/campusmac.js <<'JSEOF'
 var callLivemac = rpc.declare({
 	object: 'campusmac',
 	method: 'livemac',
-	expect: { 'mac': null, 'device': '' }
+	// NOTE: rpc.js replaces the reply value with the expect default whenever
+	// the types mismatch - a null default would overwrite a real string MAC
+	// with null. Keep the default's TYPE identical to the real value type.
+	expect: { 'mac': '' }
 });
 
 var callRotate = rpc.declare({
 	object: 'campusmac',
 	method: 'rotate',
-	expect: { 'mac': null }
+	expect: { 'mac': '' }
 });
 
 return view.extend({
@@ -177,7 +180,8 @@ return view.extend({
 		s = m.section(form.NamedSection, 'wan', 'interface', _('WAN 接口'));
 
 		o = s.option(form.Value, 'macaddr', _('WAN MAC 地址'),
-			_('WAN 口当前实际 MAC') + ': <code>' + ((live && live.mac) ? live.mac : _('未知')) + '</code>');
+			_('WAN 口当前实际 MAC') + ': <code>' + ((live && live.mac) ? live.mac : _('未知')) + '</code>' +
+			((live && live.error) ? _('（%s）').format(live.error) : ''));
 		o.rmempty = true;
 		o.datatype = 'macaddr';
 

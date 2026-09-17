@@ -3,7 +3,7 @@
 红米 RM AC2100（MediaTek MT7621A，128MB RAM / 16MB flash）专用 OpenWrt 固件，
 内置**校园网多设备检测规避**套件，通过 GitHub Actions 云端构建，本机无需 Linux 环境。
 
-**当前固件版本：v2.6.2**（刷入后 `cat /etc/campus-fix-version` 查询）
+**当前固件版本：v2.6.3**（刷入后 `cat /etc/campus-fix-version` 查询）
 
 ## 功能总览
 
@@ -79,7 +79,7 @@
 ## 使用方法
 
 1. **构建**：本仓库已配好 Actions。进 **Actions → Build RM AC2100 OpenWrt
-   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.6.2）直接 Run，
+   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.6.3）直接 Run，
    约 3-5 分钟出包。可调输入：
    - `openwrt_version`：OpenWrt 底包版本
    - `include_luci`：是否带 LuCI（false = 纯 CLI，省内存）
@@ -112,7 +112,7 @@
 ## 首次进系统检查清单
 
 ```
-cat /etc/campus-fix-version        # 应显示 2.6.2
+cat /etc/campus-fix-version        # 应显示 2.6.3
 nft list chain inet fw4 campus_ttl_postrouting     # counter 在涨 = TTL 归一生效
 nft list chain inet fw4 campus_quic_block          # drop 在涨 = 有客户端试图 QUIC
 nft list chain inet fw4 campus_leak_block          # 发现协议封锁生效
@@ -183,3 +183,4 @@ files/
 | v2.6.0 | WAN MAC 默认改回出厂（取消首刷随机化）；修复「校园网 MAC」页面显示「未知」——rpcd 只在启动时扫描 ucode 插件，首刷脚本落盘后未重启 rpcd 导致 ubus 调用失败；livemac 增加 uci 回退与 l3_device 解析 |
 | v2.6.1 | 修复两个 rpcd ucode 插件加载失败（这才是「未知/Object not found」的真正根因）：95 的 `import { pclose }`——fs 模块并无此导出（close 是 popen 句柄方法）；93 的 `new RegExp(...)`——ucode 语言没有 `new` 关键字，动态正则须用 `regexp()` 内置函数。两处均对齐官方 LuCI rpcd 插件写法 |
 | v2.6.2 | 真正根因修复：rpcd ucode 插件的返回值结构错误。rpcd 要求 `return { <对象名>: { <方法名>: { call: fn } } }`（顶层 key 即 ubus 对象名，官方 luci 插件即 `return { luci: methods }`），而 93/95 写成了 `return { status: {call:fn}, ... }`——rpcd 把方法名当对象名校验，报 "Invalid method definition: expected dictionary, got function" 后跳过注册，ubus 上永远没有 campusauth/campusmac 对象，于是 LuCI 报 Object not found / MAC 显示未知（v2.6.1 修的两处确实是 bug 但不是这个症状的根因）。附带修复：rotate 中 hex2dec→hexdec（libucode 内建名）；rpcd restart 改为仅在 rpcd 已运行时执行（首刷时 rpcd 尚未启动，S12 自然加载插件） |
+| v2.6.3 | 修两个状态显示问题。①「校园网认证」状态恒为 unknown：服务从未被 enable/启动（uci-defaults 只写 init 脚本不 enable），且 procd 触发器只在服务首次 start 后才注册——首刷后用户勾选「启用自动认证」保存也不会拉起 daemon。修复：首刷 enable+start 一次（注册 procd 条目与 reload 触发器）+ 写 ucitrack campusauth.json（LuCI 保存即 reload）+ daemon 每轮重读 uci（enabled/凭据/间隔，reload 链全失效也能自愈）+ status() 增加运行中检测（procd pidfile + kill -0，注意 sh 脚本 comm 是 sh 故不能用 pgrep -x）②「校园网 MAC」WAN 口实际 MAC 恒为未知：rpc.js 的 expect 类型校验陷阱——`expect { 'mac': null }` 会在返回值类型（String）与默认值类型（Null）不一致时把真实 MAC 覆盖成 null！改为 `expect { 'mac': '' }`。附：daemon enabled=0/无凭据时写入明确状态文案而非静默 |
