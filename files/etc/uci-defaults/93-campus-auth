@@ -85,10 +85,6 @@ cat > /usr/bin/campus-auth <<'DAEMONEOF'
 
 STATUS_FILE=/tmp/campus-auth.status
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-# HAR 实测浏览器请求还带 Accept/Accept-Language/Referer。uclient-fetch 无法
-# 自定义任意头，但至少 --header 传 Accept-Language（fetch() 各探测共用），
-# 避免出现「UA 是 Chrome 但头集极简」的脚本签名。
-UA_LANG="zh-CN,zh;q=0.9"
 
 log() { logger -t campus-auth "$1"; }
 set_status() { echo "$1" > "$STATUS_FILE"; }
@@ -211,13 +207,14 @@ looks_like_maintenance_window() {
 }
 
 # fetch url -> stdout (uclient-fetch; wget is its alias on OpenWrt).
-# Accept-Language mirrors the real browser capture so the request isn't
-# "Chrome UA with a bare header set" - a classic scripted-client tell.
+# NOTE: uclient-fetch has NO --header option (unlike GNU wget). Passing
+# --header makes it print usage and exit non-zero - v2.7.0/2.7.1 shipped
+# exactly that bug and every fetch silently failed, so the daemon could
+# never see the hijack redirect and auto-auth never ran (log showed the
+# misleading "HTTP dead, ICMP alive"). Only --user-agent is supported;
+# request-header consistency beyond UA has to happen at the client level.
 fetch() {
-	uclient-fetch -q -T 8 --user-agent "$UA" \
-		--header "Accept-Language: $UA_LANG" \
-		--header "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8" \
-		-O - "$1" 2>/dev/null
+	uclient-fetch -q -T 8 --user-agent "$UA" -O - "$1" 2>/dev/null
 }
 
 # probe the hijack gateway to learn our session params:
@@ -263,10 +260,7 @@ check_online() {
 	# poking generate_204 endpoints on a metronome.
 	for url in "http://connect.rom.miui.com/generate_204" \
 	           "http://204.ustclug.org/generate_204"; do
-		body=$(uclient-fetch -q -T 8 --user-agent "$UA" \
-			--header "Accept-Language: $UA_LANG" \
-			--header "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8" \
-			-O - "$url" 2>/dev/null)
+		body=$(uclient-fetch -q -T 8 --user-agent "$UA" -O - "$url" 2>/dev/null)
 		rc=$?
 		if [ $rc -eq 0 ]; then
 			# got an HTTP response. A hijacking AC follows the redirect
@@ -592,13 +586,10 @@ function enc(s) {
 }
 
 function fetch(url) {
-	// Accept-Language mirrors the real browser capture (same rationale as
-	// the daemon's fetch()): a Chrome UA with a bare header set is a
-	// scripted-client tell.
-	let p = popen('uclient-fetch -q -T 8 --user-agent ' + q + UA + q +
-		' --header ' + q + 'Accept-Language: zh-CN,zh;q=0.9' + q +
-		' --header ' + q + 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8' + q +
-		' -O - ' + q + url + q + ' 2>/dev/null');
+	// uclient-fetch has NO --header option (v2.7.0-2.7.2 bug: passing it
+	// made every fetch fail with a usage error, so the LuCI login button
+	// and the daemon both silently broke). UA-only request.
+	let p = popen('uclient-fetch -q -T 8 --user-agent ' + q + UA + q + ' -O - ' + q + url + q + ' 2>/dev/null');
 	let out = p.read('all');
 	p.close();
 	return out ?? '';
@@ -732,9 +723,9 @@ return {
 				}
 
 				let url = 'http://' + portal_ip + '/quickauthdisconn.do';
+				// no --header here either: uclient-fetch rejects it (see
+				// fetch() above) and the logout would silently fail
 				let cmd = 'uclient-fetch -q -T 8 --user-agent ' + q + UA + q +
-					' --header ' + q + 'Accept-Language: zh-CN,zh;q=0.9' + q +
-					' --header ' + q + 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8' + q +
 					' --post-data=' + q +
 					'wlanacip=' + (p.wlanacip ?? '10.1.110.3') +
 					'&wlanuserip=' + (p.wlanuserip ?? '') +
