@@ -244,6 +244,17 @@ probe_params() {
 		[ -n "$body" ] && PROBE_HTTP=1
 		redirect=$(echo "$body" | grep -o 'http://[^"]*portal\.do[^"]*' | head -1)
 		if [ -n "$redirect" ]; then
+			# While AUTHENTICATED the same probe targets redirect to the
+			# LOGOUT page instead (user-verified: authenticated, 3.3.3.3 ->
+			# portalLogout.do "认证成功" screen). That is NOT a login
+			# hijack: following it would make the daemon fire quickauth
+			# every cycle (201 already-online loop) - exactly the
+			# behavior-anomaly this daemon exists to avoid. Only a
+			# portal.do LOGIN redirect counts as "needs auth"; anything
+			# with "logout" in it means we are online.
+			case "$redirect" in
+				*[Ll]ogout*|*LOGOUT*) PROBE_REDIRECT=""; return 1 ;;
+			esac
 			PROBE_REDIRECT="$redirect"
 			return 0
 		fi
@@ -505,6 +516,20 @@ while true; do
 	fi
 	# campus gateway alive (hijack redirect or answered): reset backoff
 	OFFCAMPUS_STRIKES=0
+
+	# pre-auth online check: an authenticated session can still produce a
+	# login-shaped redirect from the probe targets in edge cases (AC
+	# mid-transition, stale hijack cache). Firing quickauth every cycle is
+	# the behavior anomaly this daemon must avoid, so confirm we actually
+	# CANNOT reach the internet before authenticating. ping qq.com first
+	# (cheap, no HTTP), generate_204 fallback inside check_online.
+	if check_online; then
+		AUTH_OK=1; ONLINE_STAMP=$(date +%s)
+		set_status "online(劫持探测但外网可达，判定已在线) $(date '+%Y-%m-%d %H:%M:%S')"
+		jittered_sleep "$INTERVAL"
+		continue
+	fi
+
 	Q=$(echo "$REDIRECT" | sed 's/.*portal\..do?//')
 	echo "$Q" > /tmp/campus-auth.params
 
@@ -681,13 +706,17 @@ return {
 
 				// probe hijack targets for session params (same order and
 				// rationale as the daemon's HIJACK_PROBES: 3.3.3.3 first -
-				// the campus-documented portal entry - then 10.0.0.1)
+				// the campus-documented portal entry - then 10.0.0.1).
+				// While authenticated the probes redirect to the LOGOUT page
+				// (portalLogout.do) - that is not a login hijack, skip it.
 				let redirect = null;
 				for (let probe in ['3.3.3.3', '10.0.0.1']) {
 					let body = fetch('http://' + probe + '/');
-					redirect = match(body ?? '', /http:\/\/[^"']*portal\.do\?[^"']*/);
-					if (redirect)
+					let m = match(body ?? '', /http:\/\/[^"']*portal\.do\?[^"']*/);
+					if (m && !match(m[0], /[Ll]ogout/)) {
+						redirect = m;
 						break;
+					}
 				}
 				if (!redirect)
 					return { code: null, error: '无法获取认证参数（可能已在线或网关不可达）' };
