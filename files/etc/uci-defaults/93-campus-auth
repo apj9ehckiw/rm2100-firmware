@@ -223,10 +223,16 @@ fetch() {
 # Results are passed via globals (NOT stdout - callers must not invoke this
 # inside $(...) or the PROBE_HTTP side effect is lost to the subshell):
 #   PROBE_REDIRECT  portal.do URL when hijacked, else empty
-#   PROBE_HTTP      1 when 10.0.0.1 answered at all (distinguishes
+#   PROBE_HTTP      1 when a hijack target answered at all (distinguishes
 #                  "answered but no hijack" from "unreachable")
+#   PROBE_NOTE      short reason when the AC answered with a REJECTION page
+#                  instead of a redirect (user-verified: during the nightly
+#                  force-disconnect the AC serves "该时间段不在可用区间"
+#                  style text on 3.3.3.3) - surfaced as the maintenance
+#                  status instead of the generic probe-failed text
 PROBE_REDIRECT=""
 PROBE_HTTP=0
+PROBE_NOTE=""
 # hijack probe targets, in order. The AC hijacks ANY http:// request on port
 # 80 while the session is unauthenticated (the campus notice board itself
 # tells users to type http://3.3.3.3 to reach the portal). 10.0.0.1 was the
@@ -235,10 +241,15 @@ PROBE_HTTP=0
 # entry that no legitimate upstream would answer, so a portal.do redirect
 # from it is a near-certain unauthenticated-campus signal.
 HIJACK_PROBES="3.3.3.3 10.0.0.1"
+# AC rejection-page keywords (byte-level grep on UTF-8 works in busybox).
+# The exact wording is unknown beyond the user's paraphrase ("该时间段不在
+# 可用区间，类似于这种话") so match on any of a handful of broad terms.
+MAINT_KEYWORDS="不在可用 可用区间 时间段 暂停 停机 维护"
 probe_params() {
-	local body redirect p
+	local body redirect p kw
 	PROBE_REDIRECT=""
 	PROBE_HTTP=0
+	PROBE_NOTE=""
 	for p in $HIJACK_PROBES; do
 		body=$(fetch "http://$p/") || body=""
 		[ -n "$body" ] && PROBE_HTTP=1
@@ -257,6 +268,16 @@ probe_params() {
 			esac
 			PROBE_REDIRECT="$redirect"
 			return 0
+		fi
+		# no redirect: is this the nightly rejection page? (answered but
+		# "not in the available time window"). First matching keyword wins.
+		if [ "$PROBE_HTTP" = "1" ] && [ -z "$PROBE_NOTE" ]; then
+			for kw in $MAINT_KEYWORDS; do
+				if echo "$body" | grep -q "$kw"; then
+					PROBE_NOTE="$kw"
+					break
+				fi
+			done
 		fi
 	done
 	return 1
@@ -481,6 +502,14 @@ while true; do
 				set_status "disconnected（HTTP/DNS 已断（非停机时段：疑似上游 DNS 故障），ICMP 仍通；持续探测中） $(date '+%Y-%m-%d %H:%M:%S')"
 				log "HTTP dead, ICMP alive (outside maintenance hours - upstream DNS outage?); keep probing"
 			fi
+		elif [ -n "$PROBE_NOTE" ]; then
+			# the AC ANSWERED with a rejection page ("该时间段不在可用区间"
+			# style, user-verified during the nightly disconnect) instead of
+			# a login redirect: the campus net is up but closed for the
+			# night. Nothing to authenticate against - wait quietly.
+			AUTH_OK=0
+			set_status "maintenance（校园网停机中（AC 应答：${PROBE_NOTE}），到点自动恢复认证） $(date '+%Y-%m-%d %H:%M:%S')"
+			log "AC rejection page matched '${PROBE_NOTE}'; maintenance window"
 		elif [ "$PROBE_HTTP" = "1" ]; then
 			# gateway answered but no portal.do redirect and no internet:
 			# portal moved or hijack format changed - worth a log line
@@ -504,8 +533,12 @@ while true; do
 		#     internet resets the counter now.
 		if [ "$PROBE_HTTP" != "1" ]; then
 			OFFCAMPUS_STRIKES=$(( OFFCAMPUS_STRIKES + 1 ))
+		elif [ -n "$PROBE_NOTE" ]; then
+			# AC rejection page: definitively ON the campus net (nothing
+			# else would serve that text) - never back off from it
+			OFFCAMPUS_STRIKES=0
 		elif [ "$NET_HIJACK" != "1" ] && ! tcp_ok 223.5.5.5 53; then
-			# 10.0.0.1 answered, no hijack, and even TCP to a public IP
+			# probe answered, no hijack, and even TCP to a public IP
 			# fails -> foreign network or dead upstream: back off.
 			OFFCAMPUS_STRIKES=$(( OFFCAMPUS_STRIKES + 1 ))
 		else
