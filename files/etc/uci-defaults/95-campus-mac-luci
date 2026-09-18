@@ -78,12 +78,31 @@ return {
 
 		rotate: {
 			call: function(request, args) {
-				// hexdump (NOT od - od is not in the OpenWrt busybox applet set)
-				let p = popen('hexdump -vn6 -e ' + q + '6/1 "%02x"' + q + ' /dev/urandom');
-				let out = p.read('all');
-				p.close();
-
-				let hex = replace(out, /[^0-9a-f]/g, '');
+				// Random source chain, most-reliable first:
+				//   1. /proc/sys/kernel/random/uuid - a procfs read, works
+				//      with plain cat on every kernel (strip '-' and the
+				//      version/variant nibbles, take 12 hex chars)
+				//   2. hexdump /dev/urandom (the v2.6 approach - failed on
+				//      some boxes: either popen() returned null and the
+				//      unguarded p.read() threw (the rpcd method died ->
+				//      LuCI showed "MAC 生成失败"), or the busybox hexdump
+				//      -e format produced nothing)
+				let hex = '';
+				let u = readfile('/proc/sys/kernel/random/uuid');
+				if (u) {
+					hex = replace(replace(trim(u), '-', ''), /[^0-9a-f]/g, '');
+					// skip the version nibble (uuid[12]) and variant nibble
+					// (uuid[16]) so the entropy we keep is uniform-ish
+					hex = substr(hex, 0, 12);
+				}
+				if (length(hex) < 12) {
+					let p = popen('hexdump -vn6 -e ' + q + '6/1 "%02x"' + q + ' /dev/urandom');
+					if (p) {
+						let out = p.read('all');
+						p.close();
+						hex = replace(out ?? '', /[^0-9a-f]/g, '');
+					}
+				}
 
 				if (length(hex) < 12)
 					return { mac: null, error: 'random source failed' };

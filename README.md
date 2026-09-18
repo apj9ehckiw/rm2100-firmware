@@ -3,7 +3,7 @@
 红米 RM AC2100（MediaTek MT7621A，128MB RAM / 16MB flash）专用 OpenWrt 固件，
 内置**校园网多设备检测规避**套件，通过 GitHub Actions 云端构建，本机无需 Linux 环境。
 
-**当前固件版本：v2.7.6**（刷入后 `cat /etc/campus-fix-version` 查询；LuCI 页脚也显示 `campus-fix vX.Y.Z`）
+**当前固件版本：v2.8.0**（刷入后 `cat /etc/campus-fix-version` 查询；LuCI 页脚也显示 `campus-fix vX.Y.Z`）
 
 ## 功能总览
 
@@ -21,6 +21,8 @@
 | DHCP 指纹 | WAN 伪装 `DESKTOP-CAMPUS`；LAN vendor-class 统一 | `98-campus-dhcp-fingerprint` |
 | WAN MAC | 默认出厂 MAC（不随机化）；LuCI 页面可查/改/克隆/轮换/复原（存 uci） | `95-campus-mac-luci` |
 | IPv6 泄漏 | LAN 默认关 RA/DHCPv6 | `99-campus-fix-banner` |
+| MSS 指纹混合 | WAN 出向 SYN 的 TCP MSS 统一 clamp 到路径 MTU（灰度回归，fw4guard 兜底） | `25-campus-mss.nft` `campus_mss_clamp` |
+| 代理行为封禁识别 | quickauth 应答含「禁用/禁止/代理行为/封禁」即解析分钟数，banned 状态静默到期（重复尝试会加重标记） | `93-campus-auth` |
 | 探测行为签名 | 认证守护进程间隔随机抖动（±20%）；非校园网环境指数退避并停止外部探测 | `93-campus-auth` |
 | 上游 DNS 瘫痪韧性 | dnsmasq 并发查询上限 150→500、负缓存 10s；daemon 状态区分停机/非停机时段断网 | `98-campus-dhcp-fingerprint` `93-campus-auth` |
 | 栈指纹 | tcp_timestamps/window_scaling 保持开启、rp_filter 开 | `97-campus-wan-hygiene` |
@@ -87,7 +89,7 @@
 ## 使用方法
 
 1. **构建**：本仓库已配好 Actions。进 **Actions → Build RM AC2100 OpenWrt
-   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.7.6）直接 Run，
+   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.8.0）直接 Run，
    约 3-5 分钟出包。可调输入：
    - `openwrt_version`：OpenWrt 底包版本
    - `include_luci`：是否带 LuCI（false = 纯 CLI，省内存）
@@ -120,11 +122,12 @@
 ## 首次进系统检查清单
 
 ```
-cat /etc/campus-fix-version        # 应显示 2.7.6
+cat /etc/campus-fix-version        # 应显示 2.8.0
 nft list chain inet fw4 campus_ttl_postrouting     # counter 在涨 = TTL 归一生效
 nft list chain inet fw4 campus_quic_block          # drop 在涨 = 有客户端试图 QUIC
 nft list chain inet fw4 campus_leak_block          # 发现协议封锁生效
 logread -e campus-fw4guard                         # 应有 dry-run OK（无输出=无 drop-in 或未跑）
+nft list chain inet fw4 campus_mss_clamp           # counter 在涨 = MSS 归一生效
 uci -q get network.wan.macaddr     # 自定义 WAN MAC（若通过 LuCI 设置过；出厂 MAC 时为空）
 ```
 
@@ -173,7 +176,8 @@ files/
 ├── etc/nftables.d/
 │   ├── 10-campus-ttl-fix.nft        # TTL / IP-ID / DSCP / QUIC（核心）
 │   ├── 15-campus-dns-fix.nft        # LAN DNS 强制重定向
-│   └── 20-campus-egress-hygiene.nft # DoT/发现协议/ICMP-ts 封锁 + NTP 重定向 + 可选开关
+│   ├── 20-campus-egress-hygiene.nft # DoT/发现协议/ICMP-ts 封锁 + NTP 重定向 + 可选开关
+│   └── 25-campus-mss.nft           # MSS clamp（v2.8.0 灰度回归，fw4guard 兜底）
 └── etc/uci-defaults/
     ├── 89-campus-fw4guard           # fw4 规则集自检：加载失败自动隔离 drop-in（保 LAN 永不死）
     ├── 95-campus-mac-luci           # LuCI「Campus MAC」页面
@@ -214,3 +218,4 @@ files/
 | v2.7.4 | 用户实测反馈驱动的三处修复：①劫持探测点改为 3.3.3.3 优先（校方公告的 portal 入口；未认证时 DNS 死→generate_204 域名解析失败→check_online 恒败，且 10.0.0.1 不再保证被劫持，daemon 拿不到跳转就永远进不了认证路径——探测序列改为 3.3.3.3→10.0.0.1，daemon 与 rpcd 手动认证两处同步）②在线判定第一信号改为 ping qq.com（域名解析通=DNS+ICMP 全通=真在线；用户实测未认证时 ping 223.5.5.5 也通——ICMP 对 IP 在未认证/停机两种状态下都放行，绝不能当在线依据；generate_204 降为兜底，保留 HTTP 层信号）③手动下线 code=1 修复：对照 HAR 与 portalUtil.js，官方下线请求 portaltype 是空串（getParam 取不到 logout.html URL 里不存在的参数），v2.7.3 硬编码 '0' 被 AC 拒绝；改为空串并让 LuCI 失败通知附带服务端 message |
 | v2.7.5 | 用户实测补充：**认证后访问 3.3.3.3 也会跳转**（到 portalLogout.do「认证成功」页）——v2.7.4 的劫持探测会把该跳转当成「需要认证」，导致已在线状态每 90s 发一次 quickauth（201 already-online 循环），正是要避免的行为异常。两层修复：①probe_params 提取跳转后排除 URL 含 logout 的（portalLogout.do/logout.html 均命中，大小写不敏感；未认证的 portal.do 登录跳转不含该词不受影响）——daemon 与 rpcd 手动认证两处同步②拿到登录跳转后先 check_online（ping qq.com 优先）：外网可达则直接判定已在线、跳过认证请求，杜绝任何边缘状态下的重复认证循环 |
 | v2.7.6 | 用户实测补全三态矩阵：**停机时 3.3.3.3 也会应答**——返回「该时间段不在可用区间」类拒绝文案（非劫持跳转）。v2.7.5 会把这种情况误报为 probe-failed（网关应答但无劫持跳转）。修复：probe_params 捕获 AC 拒绝页关键词（不在可用/可用区间/时间段/暂停/停机/维护，UTF-8 字节级 grep）到 PROBE_NOTE；主循环无劫持分支优先识别为 maintenance 状态（校园网在但夜间关闭，静默等待到点自动恢复认证）而非 probe-failed；off-campus 计分同步——命中拒绝文案=确凿在校园网（除校园网外无人会应答这种文本），退避计数复位永不误退避 |
+| v2.8.0 | 三项功能：①「校园网 MAC」页 MAC 生成失败修复——rotate 的 popen 未做 null 防护（popen 失败即整个 rpcd 方法抛异常→LuCI 永远显示「MAC 生成失败」），且 hexdump -e 格式在部分环境产出为空；改为 /proc/sys/kernel/random/uuid 为主随机源（procfs 纯读取零依赖，去 - 后取 12 hex），hexdump 兜底，popen 全防护②MSS clamp 灰度回归（`25-campus-mss.nft`，单文件单链）——v2.7.0 三条规则齐上导致 LAN 全死后回滚，现按「一次一条+守卫兜底」策略重启：MSS clamp 与 fw4 官方 mtu_fix 输出同款内核表达式，fw4guard（S18）boot 干跑失败自动隔离 drop-in，最坏情况=该特性静默失效而非断网③代理行为封禁识别——quickauth 应答 message 命中「禁用/禁止/代理行为/封禁」关键词即解析「N分钟」（无数字默认 30），进入 banned 状态：显示到期时刻、静默等待（封禁期间同 MAC 重复认证会加重标记）、每 5 分钟分片睡眠保持 uci 可即时停用；LuCI 认证页状态显示全面增强（状态前缀→中文标签+颜色：在线绿/封禁红/其他蓝，原始状态串小字展示，封禁时红字警示勿手动重试） |

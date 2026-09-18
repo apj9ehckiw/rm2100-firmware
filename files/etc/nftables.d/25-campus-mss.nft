@@ -1,0 +1,27 @@
+# campus-fix v2.8: TCP MSS fingerprint normalization (fw4 nftables drop-in)
+#
+# Greylisted return of ONE rule from the v2.7.0 incident (which shipped three
+# rules at once and bricked LANs - see README version history). MSS clamping
+# is chosen for the single-rule comeback because:
+#   - it is byte-identical in spirit to fw4's own mtu_fix output
+#     ("tcp flags syn tcp option maxseg size set rt mtu"), so the kernel
+#     expression is one fw4 itself emits on stock configs with MTU clamping
+#   - the fw4guard boot check (89-campus-fw4guard, S18 before fw4's S19)
+#     dry-runs the whole ruleset and quarantines ALL drop-ins on failure,
+#     so the worst case is "this rule silently off", never a dead LAN again
+#
+# Mechanism: every OS negotiates a different TCP MSS (Windows 1460, iOS/macOS
+# 1440, many Androids 1400-1440). Behind one NAT IP a detector sees many
+# distinct MSS values on parallel flows - a direct giveaway that one IP
+# fronts several different devices. Clamping every WAN-bound SYN to one
+# value makes the whole LAN negotiate like a single OS. rt mtu keeps it
+# PMTU-safe: flows with a smaller real path MTU still clamp correctly.
+#
+# If the campus baseline profile is Linux/Mac/Android (TTL 64), change the
+# baseline in 10-campus-ttl-fix.nft AND expect MSS to follow the actual
+# path MTU here - no second knob needed.
+
+chain campus_mss_clamp {
+	type filter hook forward priority mangle; policy accept;
+	oifname != "lo" tcp flags syn tcp option maxseg size set rt mtu counter comment "campus-fix: clamp MSS to path MTU (uniform fingerprint)"
+}

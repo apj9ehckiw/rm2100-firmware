@@ -588,6 +588,39 @@ while true; do
 		AUTH_URL="http://$PORTAL_IP/quickauth.do?userid=$USERID_ENC&passwd=$PASSWD_ENC&wlanuserip=$USERIP&wlanacname=$ACNAME&wlanacIp=$ACIP&ssid=&vlan=$VLAN&mac=$MAC_ENC&version=0&portalpageid=1&timestamp=$TIMESTAMP&uuid=$UUID&portaltype=0&hostname=&bindCtrlId="
 		RESP=$(fetch "$AUTH_URL")
 		CODE=$(json_get "$RESP" code)
+		MSG=$(json_get "$RESP" message)
+
+		# Ban detection: the campus anti-proxy system answers quickauth with
+		# "发现您当前网络环境存在代理行为,禁用认证30分钟" style messages.
+		# Re-authing during the ban is pointless (same MAC is already marked)
+		# and each extra attempt can re-trigger the marker, so parse the
+		# ban window and go silent until it expires.
+		BAN_SECONDS=0
+		case "$MSG" in
+			*禁用*|*禁止*|*代理行为*|*封禁*)
+				BAN_MIN=$(echo "$MSG" | grep -o '[0-9]\{1,4\} *分钟' | head -1 | grep -o '[0-9]\{1,4\}')
+				case "$BAN_MIN" in
+					''|*[!0-9]*) BAN_MIN=30 ;;  # default when no number parsed
+				esac
+				BAN_SECONDS=$(( BAN_MIN * 60 ))
+				;;
+		esac
+		if [ "$BAN_SECONDS" -gt 0 ]; then
+			BAN_UNTIL=$(( $(date +%s) + BAN_SECONDS + 60 ))  # +60s margin
+			set_status "banned（触发代理行为检测：${MSG}；认证禁至 $(date -d @${BAN_UNTIL} '+%H:%M:%S' 2>/dev/null || date '+%H:%M:%S')，期间静默不再尝试，到期自动恢复） $(date '+%Y-%m-%d %H:%M:%S')"
+			log "auth banned by AC for ${BAN_MIN}min (proxy-behavior detection); going silent"
+			# sleep in slices so uci edits (disable/interval) still apply
+			BAN_LEFT=$BAN_SECONDS
+			while [ "$BAN_LEFT" -gt 0 ]; do
+				jittered_sleep $(( BAN_LEFT > 300 ? 300 : BAN_LEFT ))
+				read_config
+				[ "$ENABLED" != "1" ] && break
+				BAN_LEFT=$(( BAN_LEFT - 300 ))
+			done
+			AUTH_OK=0
+			jittered_sleep "$INTERVAL"
+			continue
+		fi
 
 		case "$CODE" in
 			0)
@@ -931,14 +964,66 @@ return view.extend({
 		return L.resolveDefault(callStatus(), {});
 	},
 
+	// Map the daemon status prefix to a human line. The daemon writes
+	// "<state>（detail） <timestamp>" into /tmp/campus-auth.status; showing
+	// the raw string is accurate but opaque, so translate the leading token
+	// and keep the detail + timestamp visible.
+	statusLine: function(st) {
+		var raw = st.status || '未知';
+		var m = raw.match(/^([a-z-]+)[（(]?(.*)$/);
+		var head = m ? m[1] : raw;
+		var detail = raw;
+
+		var labels = {
+			'online': _('在线'),
+			'online(already)': _('在线（此前已认证）'),
+			'online(no-hijack)': _('在线（无劫持）'),
+			'online(mac-auth/免认证)': _('在线（免认证）'),
+			'banned': _('已被封禁'),
+			'maintenance': _('停机时段'),
+			'off-campus': _('非校园网络'),
+			'paused': _('已暂停'),
+			'disabled': _('未启用'),
+			'disconnected': _('已断开'),
+			'no-credentials': _('缺少凭据'),
+			'no-portal-response': _('Portal 无响应'),
+			'portal-transition': _('Portal 过渡态'),
+			'probe-failed': _('探测异常'),
+			'offline': _('离线'),
+			'bind-required': _('需设备绑定'),
+			'failed': _('认证失败'),
+			'unknown': _('未知状态')
+		};
+		var label = labels[head];
+		if (!label) {
+			// statuses like 'online(...)' variants not in the table
+			var m2 = head.match(/^(online\([^)]*\))/);
+			label = m2 ? _('在线') : null;
+		}
+		return {
+			label: label || head,
+			detail: detail,
+			isBanned: (head === 'banned'),
+			isOnline: (head.indexOf('online') === 0)
+		};
+	},
+
 	render: function(st) {
 		var m, s, o;
 
+		var stat = this.statusLine(st);
+		var color = stat.isBanned ? '#e03131' : (stat.isOnline ? '#2f9e44' : '#5c7cfa');
+		var weight = (stat.isBanned || stat.isOnline) ? 'font-weight:700;' : '';
+
 		m = new form.Map('campusauth', _('校园网认证'),
 			_('校园网 Portal 自动认证（抓包逆向实现）。保存凭据并启用后，后台服务会自动登录并掉线重连。') +
-			_('<br /><br />当前状态：<code>%s</code>（后台服务：%s）')
-				.format(st.status || '未知',
-					(st.running === true) ? _('运行中') : _('未运行')));
+			_('<br /><br />当前状态：<span style="color:%s;%s">%s</span>（后台服务：%s）<br /><code style="font-size:0.85em">%s</code>')
+				.format(color, weight, stat.label,
+					(st.running === true) ? _('运行中') : _('未运行'),
+					stat.detail) +
+			(stat.isBanned
+				? _('<br /><b style="color:#e03131">注意：触发代理行为检测已被封禁。封禁期间同 MAC 重复尝试认证会加重标记，守护进程已静默等待，请勿手动点击「登录」。到期后自动恢复。</b>')
+				: ''));
 
 		s = m.section(form.NamedSection, 'login', 'login', _('认证设置'));
 
