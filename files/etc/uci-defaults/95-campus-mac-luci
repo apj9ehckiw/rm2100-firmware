@@ -169,16 +169,20 @@ cat > /www/luci-static/resources/view/campusmac.js <<'JSEOF'
 var callLivemac = rpc.declare({
 	object: 'campusmac',
 	method: 'livemac',
-	// NOTE: rpc.js replaces the reply value with the expect default whenever
-	// the types mismatch - a null default would overwrite a real string MAC
-	// with null. Keep the default's TYPE identical to the real value type.
-	expect: { 'mac': '' }
+	// expect:{} keeps the WHOLE result object ({mac, device}) for render().
+	// rpc.js semantics: a non-empty expect key UNPACKS the reply -
+	// handleCallReply does ret = ret[key] - so `expect: {mac:''}` handed
+	// render() a bare string whose `.mac` property was undefined and the
+	// page showed "未知" forever. (v2.6.3 fixed the type-mismatch half of
+	// the expect rule - a null default overwriting the real MAC - but not
+	// the unpacking half; both halves are why v2.8.0 still failed.)
+	expect: {}
 });
 
 var callRotate = rpc.declare({
 	object: 'campusmac',
 	method: 'rotate',
-	expect: { 'mac': '' }
+	expect: {}
 });
 
 return view.extend({
@@ -215,7 +219,11 @@ return view.extend({
 					ui.addNotification(null, _('新随机 MAC：<code>%s</code>——点击「保存并应用」生效。').format(ret.mac), 'info');
 				}
 				else {
-					ui.addNotification(null, _('MAC 生成失败'), 'error');
+					// 后端明确报错（random source failed）时带上原因；
+					// RPC 传输层错误（Object not found 等）会 reject
+					// 走 .catch 分支，根本不会进这个 then
+					var why = (ret && ret.error) ? _('：%s').format(ret.error) : '';
+					ui.addNotification(null, _('MAC 生成失败%s').format(why), 'error');
 				}
 			});
 		};

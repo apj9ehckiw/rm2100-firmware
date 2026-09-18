@@ -3,7 +3,7 @@
 红米 RM AC2100（MediaTek MT7621A，128MB RAM / 16MB flash）专用 OpenWrt 固件，
 内置**校园网多设备检测规避**套件，通过 GitHub Actions 云端构建，本机无需 Linux 环境。
 
-**当前固件版本：v2.8.0**（刷入后 `cat /etc/campus-fix-version` 查询；LuCI 页脚也显示 `campus-fix vX.Y.Z`）
+**当前固件版本：v2.8.1**（刷入后 `cat /etc/campus-fix-version` 查询；LuCI 页脚也显示 `campus-fix vX.Y.Z`）
 
 ## 功能总览
 
@@ -89,13 +89,12 @@
 ## 使用方法
 
 1. **构建**：本仓库已配好 Actions。进 **Actions → Build RM AC2100 OpenWrt
-   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.8.0）直接 Run，
+   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.8.1）直接 Run，
    约 3-5 分钟出包。可调输入：
    - `openwrt_version`：OpenWrt 底包版本
    - `include_luci`：是否带 LuCI（false = 纯 CLI，省内存）
    - `fw_version`：版本戳（写进固件 + artifact 名
      `rm2100-firmware-v<版本>-openwrt-<OpenWrt 版本>`）
-
 2. **下载校验**：从 run 页面下载 artifact，解压得到三个 .bin + `sha256sums`。
    本地 `sha256sum -c sha256sums` 全 OK 再刷。
    > RM AC2100 是 NAND 闪存，OpenWrt 官方**不产出 factory.bin**，
@@ -122,7 +121,7 @@
 ## 首次进系统检查清单
 
 ```
-cat /etc/campus-fix-version        # 应显示 2.8.0
+cat /etc/campus-fix-version        # 应显示 2.8.1
 nft list chain inet fw4 campus_ttl_postrouting     # counter 在涨 = TTL 归一生效
 nft list chain inet fw4 campus_quic_block          # drop 在涨 = 有客户端试图 QUIC
 nft list chain inet fw4 campus_leak_block          # 发现协议封锁生效
@@ -165,6 +164,7 @@ uci -q get network.wan.macaddr     # 自定义 WAN MAC（若通过 LuCI 设置�
 | 触发「代理行为」封禁 | v2.7.1 已含守护进程抖动退避 + 请求头补齐（MSS/速率规则因 v2.7.0 事故撤回）；若再次触发，先确认终端是否开着代理/VPN 客户端 |
 | 刷后 LAN 不通 / 拿不到 IP | `logread -e campus-fw4guard` —— v2.7.1 起规则集加载失败会自动隔离 `/etc/nftables.d/` 下全部 drop-in 并按原厂防火墙起网（日志可见），LAN 永不再因规则挂掉 |
 | 改 MAC 后无法上网 | 认证会话绑旧 MAC——认证页重新登录 |
+| 「校园网 MAC」页点「生成」报 MAC 生成失败（Network 面板看 rpcd 应答正常） | v2.8.1 已修：前端 rpc.declare 的 `expect:{'mac':''}` 把应答解包成裸字符串，`ret.mac` 为 undefined 走了失败分支（livemac 同因致「实际 MAC」恒显未知）。改 `expect:{}` 取完整对象 |
 | 某应用异常 | 先查 `nft list chain inet fw4 campus_leak_block` 的 drop 计数是否在涨，确认是否被卫生规则误伤 |
 | 内存告急 | 128MB 上限：别装 docker/大插件；或构建时 `include_luci=false` |
 | 刷砖 | breed 不死引导兜底：重进 breed 重刷即可，之前备份的编程器固件也能救回 |
@@ -219,3 +219,4 @@ files/
 | v2.7.5 | 用户实测补充：**认证后访问 3.3.3.3 也会跳转**（到 portalLogout.do「认证成功」页）——v2.7.4 的劫持探测会把该跳转当成「需要认证」，导致已在线状态每 90s 发一次 quickauth（201 already-online 循环），正是要避免的行为异常。两层修复：①probe_params 提取跳转后排除 URL 含 logout 的（portalLogout.do/logout.html 均命中，大小写不敏感；未认证的 portal.do 登录跳转不含该词不受影响）——daemon 与 rpcd 手动认证两处同步②拿到登录跳转后先 check_online（ping qq.com 优先）：外网可达则直接判定已在线、跳过认证请求，杜绝任何边缘状态下的重复认证循环 |
 | v2.7.6 | 用户实测补全三态矩阵：**停机时 3.3.3.3 也会应答**——返回「该时间段不在可用区间」类拒绝文案（非劫持跳转）。v2.7.5 会把这种情况误报为 probe-failed（网关应答但无劫持跳转）。修复：probe_params 捕获 AC 拒绝页关键词（不在可用/可用区间/时间段/暂停/停机/维护，UTF-8 字节级 grep）到 PROBE_NOTE；主循环无劫持分支优先识别为 maintenance 状态（校园网在但夜间关闭，静默等待到点自动恢复认证）而非 probe-failed；off-campus 计分同步——命中拒绝文案=确凿在校园网（除校园网外无人会应答这种文本），退避计数复位永不误退避 |
 | v2.8.0 | 三项功能：①「校园网 MAC」页 MAC 生成失败修复——rotate 的 popen 未做 null 防护（popen 失败即整个 rpcd 方法抛异常→LuCI 永远显示「MAC 生成失败」），且 hexdump -e 格式在部分环境产出为空；改为 /proc/sys/kernel/random/uuid 为主随机源（procfs 纯读取零依赖，去 - 后取 12 hex），hexdump 兜底，popen 全防护②MSS clamp 灰度回归（`25-campus-mss.nft`，单文件单链）——v2.7.0 三条规则齐上导致 LAN 全死后回滚，现按「一次一条+守卫兜底」策略重启：MSS clamp 与 fw4 官方 mtu_fix 输出同款内核表达式，fw4guard（S18）boot 干跑失败自动隔离 drop-in，最坏情况=该特性静默失效而非断网③代理行为封禁识别——quickauth 应答 message 命中「禁用/禁止/代理行为/封禁」关键词即解析「N分钟」（无数字默认 30），进入 banned 状态：显示到期时刻、静默等待（封禁期间同 MAC 重复认证会加重标记）、每 5 分钟分片睡眠保持 uci 可即时停用；LuCI 认证页状态显示全面增强（状态前缀→中文标签+颜色：在线绿/封禁红/其他蓝，原始状态串小字展示，封禁时红字警示勿手动重试） |
+| v2.8.1 | 「MAC 生成失败」真正根因修复：v2.8.0 修的是后端随机源（popen 防护/uuid 主源），但用户实测 Network 面板显示 rpcd 应答完全正常（`[0,{"mac":"02eeef99817f"}]`）仍报失败——问题在前端。rpc.js 的 `expect:{'mac':''}` 会把应答**解包**成裸字符串（handleCallReply 里 `ret=ret[key]`），前端 `ret.mac` 取值 undefined→永远走失败分支（livemac 同链路，「WAN 口当前实际 MAC」也因此恒显未知）。改 `expect:{}` 保留完整对象（campusauth 页 2026-09-17 起就是这么写的，MAC 页漏改）；失败通知附带后端 error 原因。教训：rpc.declare 的 expect 每个 key 都是一次解包+类型校验，取对象字段必须空 expect 拿整包 |
