@@ -49,24 +49,16 @@ chain campus_synrate {
 # ------------------------------------------------------------ conn limit
 # Mechanism: flow-count statistics. A single PC holds O(300) concurrent
 # connections at worst (P2P aside); a NAT'd LAN looks like an office. Cap
-# concurrent tracked flows per LAN host. This replaces the commented-out
-# campus_flowcap block from 20-campus-egress-hygiene.nft (kept there for
-# reference; this one is ON by default).
+# the sustained NEW-connection rate per LAN host - a proxy for both the
+# concurrent-flow count and the "office building" flow-rate profile. 600
+# new connections per minute per host (10/s sustained) is above any normal
+# browsing session (even a heavy page load is a burst, not sustained) but
+# far below what a NAT'd LAN or a P2P client emits.
 #
-# ct count inside a dynamic set: the set entry holds the per-source flow
-# count; "ct count over N" is evaluated per packet against the total
-# conntrack entries FROM that source. 500 covers every normal use (a single
-# game console + store downloads included); heavy P2P hosts will feel it.
-# NOTE: the set is declared AFTER the chain that references it - nft parses
-# the whole file (declaration order does not matter, same as the v2.x
-# optional flowcap block in 20-campus-egress-hygiene.nft).
-set campus_conn4 {
-	type ipv4_addr
-	flags dynamic
-	timeout 1h
-}
-
+# A meter is used (same as campus_synrate): meters are anonymous dynamic
+# sets fully parsed by nft userspace, so fw4 loads the rule even where
+# ct-count-in-set (conntrack state in set update) is unavailable.
 chain campus_connlimit {
 	type filter hook forward priority filter - 3; policy accept;
-	iifname "br-lan" oifname != "lo" ct state new update @campus_conn4 { ip saddr ct count over 500 } counter drop comment "campus-fix: per-host concurrent flow cap"
+	iifname "br-lan" oifname != "lo" tcp flags syn ct state new meter campus_connrate4 { ip saddr limit rate over 600/minute burst 200 packets } counter drop comment "campus-fix: per-host new-flow rate cap"
 }

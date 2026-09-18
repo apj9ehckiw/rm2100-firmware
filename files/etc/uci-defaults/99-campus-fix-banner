@@ -14,7 +14,7 @@ cat > /etc/banner <<EOF
    QUIC UDP/443  -> DROP          (nft list chain inet fw4 campus_quic_block)
    MSS           -> clamp to PMTU (nft list chain inet fw4 campus_mss_clamp)
    SYN rate      -> 40/s per host (nft list chain inet fw4 campus_synrate)
-   flows/host    -> cap 500       (nft list chain inet fw4 campus_connlimit)
+   new flows     -> 600/min per host (nft list chain inet fw4 campus_connlimit)
    DNS           -> forced to system resolver (dnsmasq, no client bypass)
    DoT 853       -> DROP            (campus_leak_block)
    NetBIOS/SMB/SSDP/mDNS/LLMNR egress -> DROP (campus_leak_block)
