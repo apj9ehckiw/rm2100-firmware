@@ -3,7 +3,7 @@
 红米 RM AC2100（MediaTek MT7621A，128MB RAM / 16MB flash）专用 OpenWrt 固件，
 内置**校园网多设备检测规避**套件，通过 GitHub Actions 云端构建，本机无需 Linux 环境。
 
-**当前固件版本：v2.6.10**（刷入后 `cat /etc/campus-fix-version` 查询；LuCI 页脚也显示 `campus-fix vX.Y.Z`）
+**当前固件版本：v2.7.0**（刷入后 `cat /etc/campus-fix-version` 查询；LuCI 页脚也显示 `campus-fix vX.Y.Z`）
 
 ## 功能总览
 
@@ -21,6 +21,11 @@
 | DHCP 指纹 | WAN 伪装 `DESKTOP-CAMPUS`；LAN vendor-class 统一 | `98-campus-dhcp-fingerprint` |
 | WAN MAC | 默认出厂 MAC（不随机化）；LuCI 页面可查/改/克隆/轮换/复原（存 uci） | `95-campus-mac-luci` |
 | IPv6 泄漏 | LAN 默认关 RA/DHCPv6 | `99-campus-fix-banner` |
+| MSS 指纹混合 | WAN 出向 SYN 的 TCP MSS 统一 clamp 到路径 MTU（Windows 1460 基线） | `25-campus-connlimit.nft` `campus_mss_clamp` |
+| 新建连接速率 | 每 LAN 主机 SYN 速率限制（40/s，突发 100），消除 N 台设备的聚合突发签名 | 同上 `campus_synrate` |
+| 并发流数 | 每 LAN 主机并发连接上限 500（动态 set），对抗流数统计 | 同上 `campus_connlimit` |
+| 探测行为签名 | 认证守护进程间隔随机抖动（±20%）；非校园网环境指数退避并停止外部探测 | `93-campus-auth` |
+| 请求头一致性 | uclient-fetch 请求补齐 Accept/Accept-Language（对齐真实浏览器抓包头集） | 同上 |
 | 栈指纹 | tcp_timestamps/window_scaling 保持开启、rp_filter 开 | `97-campus-wan-hygiene` |
 | IP-MAC 绑定 / 客户端数 | NAT 天然只暴露路由器单 MAC + 单认证会话 | 无需配置 |
 | UA/系统指纹 | 路由器层无法改写 HTTPS 内 UA；QUIC 已封后用终端浏览器扩展做 UA 一致化 | 终端侧 |
@@ -32,8 +37,10 @@
 `service firewall restart`：
 
 - **IGMP 出方向 DROP**：多播成员报告暴露多接收者。不用校园 IPTV 才能开。
-- **每主机并发连接数上限**（300，dynamic set）：对抗流数统计。取消注释
-  `campus_flowtab4` set 和 `campus_flowcap` chain 两个块。
+- **并发流数 / SYN 速率调参**：v2.7 起默认启用（`25-campus-connlimit.nft`，
+  500 并发 / 40 SYN/s）。P2P 或大流量场景觉得被限，改该文件里的
+  `ct count over 500` 与 `limit rate over 40/second` 后
+  `service firewall restart`。
 
 ### LuCI 页面「校园网 MAC」（网络菜单）
 
@@ -79,7 +86,7 @@
 ## 使用方法
 
 1. **构建**：本仓库已配好 Actions。进 **Actions → Build RM AC2100 OpenWrt
-   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.6.10）直接 Run，
+   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.7.0）直接 Run，
    约 3-5 分钟出包。可调输入：
    - `openwrt_version`：OpenWrt 底包版本
    - `include_luci`：是否带 LuCI（false = 纯 CLI，省内存）
@@ -112,10 +119,12 @@
 ## 首次进系统检查清单
 
 ```
-cat /etc/campus-fix-version        # 应显示 2.6.10
+cat /etc/campus-fix-version        # 应显示 2.7.0
 nft list chain inet fw4 campus_ttl_postrouting     # counter 在涨 = TTL 归一生效
 nft list chain inet fw4 campus_quic_block          # drop 在涨 = 有客户端试图 QUIC
 nft list chain inet fw4 campus_leak_block          # 发现协议封锁生效
+nft list chain inet fw4 campus_mss_clamp           # counter 在涨 = MSS 归一生效
+nft list chain inet fw4 campus_connlimit           # drop 在涨 = 有主机超 500 并发流
 uci -q get network.wan.macaddr     # 自定义 WAN MAC（若通过 LuCI 设置过；出厂 MAC 时为空）
 ```
 
@@ -145,7 +154,8 @@ uci -q get network.wan.macaddr     # 自定义 WAN MAC（若通过 LuCI 设置�
 
 | 症状 | 处理 |
 |---|---|
-| TTL 改过仍被踢 | v2.x 已覆盖 IP-ID/DSCP/QUIC/DNS/DHCP/MAC；再被踢说明检测在 TLS 指纹（JA3）或行为统计层，需终端侧配合 |
+| TTL 改过仍被踢 | v2.7 已覆盖 TTL/IP-ID/DSCP/QUIC/DNS/DHCP/MAC/MSS/流数/速率；再被踢说明检测在 TLS 指纹（JA3）或 UA 层，需终端侧配合（浏览器扩展统一 UA） |
+| 触发「代理行为」封禁 | v2.7 已加 MSS 归一/SYN 速率/流数上限 + 守护进程抖动退避；若再次触发，先确认终端是否开着代理/VPN 客户端（检测文案可能针对 TUN/TLS 特征） |
 | 改 MAC 后无法上网 | 认证会话绑旧 MAC——认证页重新登录 |
 | 某应用异常 | 先查 `nft list chain inet fw4 campus_leak_block` 的 drop 计数是否在涨，确认是否被卫生规则误伤 |
 | 内存告急 | 128MB 上限：别装 docker/大插件；或构建时 `include_luci=false` |
@@ -158,7 +168,8 @@ files/
 ├── etc/nftables.d/
 │   ├── 10-campus-ttl-fix.nft        # TTL / IP-ID / DSCP / QUIC（核心）
 │   ├── 15-campus-dns-fix.nft        # LAN DNS 强制重定向
-│   └── 20-campus-egress-hygiene.nft # DoT/发现协议/ICMP-ts 封锁 + NTP 重定向 + 可选开关
+│   ├── 20-campus-egress-hygiene.nft # DoT/发现协议/ICMP-ts 封锁 + NTP 重定向 + 可选开关
+│   └── 25-campus-connlimit.nft      # MSS clamp + SYN 速率 + 并发流数上限（v2.7 默认启用）
 └── etc/uci-defaults/
     ├── 95-campus-mac-luci           # LuCI「Campus MAC」页面
     ├── 96-campus-ntp-server         # 路由器自身 ntpd 开 LAN 监听
@@ -191,3 +202,4 @@ files/
 | v2.6.8 | 自动认证调度：新增运行时间区间（active_start/active_end，HH:MM，支持跨午夜如 22:00-06:00，留空=全天）与运行星期开关（day_1~day_6/day_0 复选框，默认每天）。两层闸门独立组合：时段外/未勾选当天暂停一切探测与登录（状态显示 paused 及原因）；配置畸形 fail-open（视为全天/每天，手误不至于让认证哑火）；跨午夜窗口 00:00 后按新一天判断。LuCI 无 'time' datatype（未注册类型会让 Validator 抛错毁表单），HH:MM 校验用自定义 validate；shell test 无 >= 操作符用 NOT(小于) 组合（20+11 单测用例全过） |
 | v2.6.9 | LuCI 界面显示固件版本号：99-campus-fix-banner 首刷时向主题 footer 模板（argon 的 footer/footer_login、bootstrap 的 footer）注入「campus-fix vX.Y.Z」，登录页与所有管理页页脚可见，不再需要 ssh 查 `/etc/campus-fix-version`。注入带 grep 幂等保护（重复运行不叠加）；sed BRE 陷阱记录：`\(...\)` 是分组、裸 `)` 是字面括号，bootstrap 的 `(distrevision }})</a>` 匹配不能给右括号加转义 |
 | v2.6.10 | 修复「校园网认证」页保存报错：运行开始/结束时间填任何合法 HH:MM（如 07:00）都被拒——自定义 validate 签名写错。LuCI 框架经 `getValidator()` 做 `L.bind(this.validate, this, section_id)`，`validation.js` 再以 `vfunc(value)` 调用，实际展开为 `f(section_id, value)`——单参数 `f(value)` 接到的是 section id（'login'）而非输入值，正则永远不匹配。改为官方签名 `f(section_id, value)`（对齐 firewall/ipsets 等官方视图写法）。13 个边界用例（合法 HH:MM×4、空/null、`7:00`/`24:00`/`07:0`/`07:60`/`07:00:00` 等非法值×7）模拟完整绑定链全部通过 |
+| v2.7.0 | 反检测升级（响应「发现您当前网络环境存在代理行为,禁用认证30分钟」触发）：①新增 `25-campus-connlimit.nft`——WAN 出向 SYN 的 TCP MSS 统一 clamp 到路径 MTU（消除 Windows 1460 / iOS 1440 / Android 1400-1460 的多设备混合指纹）、每 LAN 主机 SYN 速率限制（meter limit 40/s 突发 100，消除 N 设备聚合突发）、并发流数上限 500（动态 set + ct count，替代旧可选块，默认启用）②守护进程行为人性化：探测间隔 ±20% 随机抖动（消除固定 90s 秒表签名；busybox 无 $RANDOM，用 PID×7+秒数×13 混合散布）；非校园网环境（网关静默 3 轮起）指数退避至 10 倍间隔并完全停止外部 generate_204 探测——路由器挂在移动 WiFi 等外部网络时不再周期性戳探测点（正是被判定「代理行为」的流量形态）；检测到校园网关应答立即复位③uclient-fetch 请求头补齐 Accept/Accept-Language（对齐 HAR 实测浏览器头集，消除「Chrome UA + 极简头」的脚本签名），daemon 与 rpcd ucode 插件三处 fetch 全部生效 |

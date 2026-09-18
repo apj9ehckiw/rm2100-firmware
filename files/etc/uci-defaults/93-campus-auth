@@ -1,5 +1,5 @@
 #!/bin/sh
-# campus-fix v2.5: campus portal auto-login daemon + LuCI page.
+# campus-fix v2.7: campus portal auto-login daemon + LuCI page.
 #
 # Reverse-engineered from a HAR capture of the portal flow
 # (广东某职业院校 / 中山校区 Portal, NFV-BASE-1 AC):
@@ -85,9 +85,36 @@ cat > /usr/bin/campus-auth <<'DAEMONEOF'
 
 STATUS_FILE=/tmp/campus-auth.status
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+# HAR 实测浏览器请求还带 Accept/Accept-Language/Referer。uclient-fetch 无法
+# 自定义任意头，但至少 --header 传 Accept-Language（fetch() 各探测共用），
+# 避免出现「UA 是 Chrome 但头集极简」的脚本签名。
+UA_LANG="zh-CN,zh;q=0.9"
 
 log() { logger -t campus-auth "$1"; }
 set_status() { echo "$1" > "$STATUS_FILE"; }
+
+# sleep with human-like jitter: a fixed 90s loop is a stopwatch signature.
+# ±20% around the configured interval (bounded 5..600s).
+jittered_sleep() {
+	local base jitter s
+	base=${1:-90}
+	case "$base" in ''|*[!0-9]*) base=90 ;; esac
+	jitter=$(( base / 5 ))
+	[ "$jitter" -lt 1 ] && jitter=1
+	# busybox 无 $RANDOM：用 PID+秒数的低位混合，凑一个 0..2*jitter 的散布
+	s=$(( ( $$ * 7 + $(date +%S) * 13 ) % ( jitter * 2 + 1 ) - jitter ))
+	[ "$s" -lt 0 ] && s=0
+	sleep $(( base + s > 5 ? base + s : 5 ))
+}
+
+# off-campus backoff: consecutive rounds with the campus portal entirely
+# absent (gateway silent AND probes dead AND no hijack). Each miss multiplies
+# the sleep (up to 10x the interval); any sign of the campus network (gateway
+# answers, hijack redirect seen) resets it to 0. This is what stops the
+# daemon from hammering external probe URLs every 90s while the router sits
+# on a mobile/CMCC WiFi hotspot - the very "proxy behavior" traffic pattern
+# that got the account flagged.
+OFFCAMPUS_STRIKES=0
 
 # refresh uci-derived settings (called each loop iteration)
 read_config() {
@@ -168,9 +195,14 @@ in_active_window() {
 	fi
 }
 
-# fetch url -> stdout (uclient-fetch; wget is its alias on OpenWrt)
+# fetch url -> stdout (uclient-fetch; wget is its alias on OpenWrt).
+# Accept-Language mirrors the real browser capture so the request isn't
+# "Chrome UA with a bare header set" - a classic scripted-client tell.
 fetch() {
-	uclient-fetch -q -T 8 --user-agent "$UA" -O - "$1" 2>/dev/null
+	uclient-fetch -q -T 8 --user-agent "$UA" \
+		--header "Accept-Language: $UA_LANG" \
+		--header "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8" \
+		-O - "$1" 2>/dev/null
 }
 
 # probe the hijack gateway to learn our session params:
@@ -211,9 +243,15 @@ check_online() {
 	local body rc
 	# miui first: China-mobile IP, direct domestic route. ustclug sits
 	# behind Cloudflare, which campus networks rate-limit at peak hours.
+	# While in off-campus backoff these external probes are SKIPPED entirely
+	# (see OFFCAMPUS_STRIKES) - a router on a mobile hotspot must not keep
+	# poking generate_204 endpoints on a metronome.
 	for url in "http://connect.rom.miui.com/generate_204" \
 	           "http://204.ustclug.org/generate_204"; do
-		body=$(uclient-fetch -q -T 8 --user-agent "$UA" -O - "$url" 2>/dev/null)
+		body=$(uclient-fetch -q -T 8 --user-agent "$UA" \
+			--header "Accept-Language: $UA_LANG" \
+			--header "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8" \
+			-O - "$url" 2>/dev/null)
 		rc=$?
 		if [ $rc -eq 0 ]; then
 			# got an HTTP response. A hijacking AC follows the redirect
@@ -286,6 +324,18 @@ while true; do
 		continue
 	fi
 
+	# off-campus backoff: after several consecutive rounds where the
+	# campus gateway AND portal are both completely silent (router sits
+	# on a mobile/other WiFi), stretch the sleep multiplicatively. Any
+	# campus sign (gateway answer, hijack, portal response) resets it.
+	# The multiplier caps at 10x; check_online's external probes are
+	# also skipped once strikes >= 3 so a non-campus network never sees
+	# the periodic generate_204 pattern at all.
+	BACKOFF=1
+	if [ "$OFFCAMPUS_STRIKES" -ge 3 ]; then
+		BACKOFF=$(( OFFCAMPUS_STRIKES > 10 ? 10 : OFFCAMPUS_STRIKES ))
+	fi
+
 	# --- gather session params ----------------------------------------
 	# The hijack gateway only answers with a portal.do redirect while the
 	# session is UNAUTHENTICATED. Once online (e.g. MAC-based silent auth:
@@ -296,8 +346,26 @@ while true; do
 	# NOTE: check_online runs EVERY cycle (also when AUTH_OK=1): this campus
 	# force-disconnects on weeknights 23:30+ while ICMP still answers, so a
 	# ping-based check would show "online" through a dead HTTP layer.
-	probe_params
-	REDIRECT="$PROBE_REDIRECT"
+	# Off-campus gate: with strikes >= 3 the campus gateway has been silent
+	# for a while - probing it once more is cheap (LAN-side, goes nowhere on
+	# a foreign network), but the EXTERNAL probes inside check_online are
+	# what leak the periodic pattern, so skip them entirely.
+	if [ "$OFFCAMPUS_STRIKES" -ge 3 ]; then
+		probe_params
+		REDIRECT="$PROBE_REDIRECT"
+		if [ -z "$REDIRECT" ] && [ "$PROBE_HTTP" != "1" ]; then
+			# still no campus gateway: remain in backoff, no external traffic
+			OFFCAMPUS_STRIKES=$(( OFFCAMPUS_STRIKES + 1 ))
+			set_status "off-campus（未检测到校园网关，退避探测中 x${OFFCAMPUS_STRIKES}） $(date '+%Y-%m-%d %H:%M:%S')"
+			jittered_sleep $(( INTERVAL * BACKOFF ))
+			continue
+		fi
+		# gateway answered: campus network is back - fall through, reset below
+		OFFCAMPUS_STRIKES=0
+	else
+		probe_params
+		REDIRECT="$PROBE_REDIRECT"
+	fi
 	if [ -z "$REDIRECT" ]; then
 		if [ "$AUTH_OK" = "1" ] && check_online; then
 			# authenticated earlier and HTTP layer still works: stay online.
@@ -345,9 +413,19 @@ while true; do
 			set_status "offline（网关不可达，外网不通） $(date '+%Y-%m-%d %H:%M:%S')"
 			log "hijack gateway probe failed (gateway down or portal moved)"
 		fi
-		sleep "$INTERVAL"
+		# gateway fully silent AND no hijack: could be off-campus (mobile
+		# hotspot) or total outage. Count it toward the off-campus backoff;
+		# a reachable campus gateway resets the counter in the next round.
+		if [ "$PROBE_HTTP" != "1" ]; then
+			OFFCAMPUS_STRIKES=$(( OFFCAMPUS_STRIKES + 1 ))
+		else
+			OFFCAMPUS_STRIKES=0
+		fi
+		jittered_sleep $(( INTERVAL * BACKOFF ))
 		continue
 	fi
+	# campus gateway alive (hijack redirect or answered): reset backoff
+	OFFCAMPUS_STRIKES=0
 	Q=$(echo "$REDIRECT" | sed 's/.*portal\..do?//')
 	echo "$Q" > /tmp/campus-auth.params
 
@@ -364,7 +442,7 @@ while true; do
 	# --- try login ------------------------------------------------
 		if [ -z "$USERID" ] || [ -z "$PASSWD" ]; then
 			set_status "no-credentials（学号或密码未设置） $(date '+%Y-%m-%d %H:%M:%S')"
-			sleep "$INTERVAL"
+			jittered_sleep "$INTERVAL"
 			continue
 		fi
 		MAC_ENC=$(echo "$MAC" | sed 's/:/%3A/g')
@@ -403,7 +481,7 @@ while true; do
 		log "PortalJsonAction unreachable"
 	fi
 
-	sleep "$INTERVAL"
+	jittered_sleep "$INTERVAL"
 done
 DAEMONEOF
 chmod +x /usr/bin/campus-auth
@@ -450,7 +528,13 @@ function enc(s) {
 }
 
 function fetch(url) {
-	let p = popen('uclient-fetch -q -T 8 --user-agent ' + q + UA + q + ' -O - ' + q + url + q + ' 2>/dev/null');
+	// Accept-Language mirrors the real browser capture (same rationale as
+	// the daemon's fetch()): a Chrome UA with a bare header set is a
+	// scripted-client tell.
+	let p = popen('uclient-fetch -q -T 8 --user-agent ' + q + UA + q +
+		' --header ' + q + 'Accept-Language: zh-CN,zh;q=0.9' + q +
+		' --header ' + q + 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8' + q +
+		' -O - ' + q + url + q + ' 2>/dev/null');
 	let out = p.read('all');
 	p.close();
 	return out ?? '';
@@ -585,6 +669,8 @@ return {
 
 				let url = 'http://' + portal_ip + '/quickauthdisconn.do';
 				let cmd = 'uclient-fetch -q -T 8 --user-agent ' + q + UA + q +
+					' --header ' + q + 'Accept-Language: zh-CN,zh;q=0.9' + q +
+					' --header ' + q + 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8' + q +
 					' --post-data=' + q +
 					'wlanacip=' + (p.wlanacip ?? '10.1.110.3') +
 					'&wlanuserip=' + (p.wlanuserip ?? '') +

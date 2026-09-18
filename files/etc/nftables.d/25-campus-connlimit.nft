@@ -1,0 +1,72 @@
+# campus-fix v2.7: TCP fingerprint + behavioral counters (fw4 nftables drop-in)
+#
+# Targets the remaining "proxy/router detected" vectors the v2.x rules don't
+# cover. The trigger banner was: "发现您当前网络环境存在代理行为" - these
+# ruleset families are the classic causes on a NAT router with many LAN
+# devices behind one session:
+#
+#   campus_mss_clamp   - per-OS TCP MSS fingerprint mixing
+#   campus_synrate     - new-connection burst signature (flow-rate stats)
+#   campus_connlimit   - concurrent flow count per LAN host (flow-count stats)
+#
+# All three are default-on: they are invisible in single-host use and only
+# bound the aggregate to what one busy PC produces.
+
+# ---------------------------------------------------------------- MSS clamp
+# Mechanism: every OS negotiates a different TCP MSS (Windows 1460, iOS/macOS
+# 1440, many Androids 1400-1440). Behind one NAT IP a detector sees MANY
+# distinct MSS values on parallel flows - a direct giveaway that one IP is
+# fronting several different devices. clamping MSS to ONE value on all
+# WAN-bound SYNs makes the whole LAN negotiate like a single OS.
+# 1460 = the plain-Ethernet Windows value (matches our TTL=128 baseline).
+# If you switch the TTL baseline to 64 (Linux/Mac profile), change this to
+# 1440 as well.
+#
+# mangle FORWARD is used (not postrouting): the clamp must rewrite the
+# FORWARDED SYN itself. The MTU route method is used because it is
+# PMTU-safe: established flows with a smaller real path-MTU still get
+# correct clamping via the route metric.
+chain campus_mss_clamp {
+	type filter hook forward priority mangle; policy accept;
+	oifname != "lo" tcp flags syn tcp option maxseg size set rt mtu counter comment "campus-fix: clamp MSS to path MTU (uniform 1460)"
+}
+
+# ------------------------------------------------------------ SYN rate limit
+# Mechanism: one host opens connections at human/web-page rates (a few SYN/s
+# even when loading a heavy site). A NAT with N devices bursts far higher,
+# and flow-rate anomaly detectors flag exactly that. Meter NEW connections
+# per LAN source and drop only the excess above the burst. 40 syn/s with a
+# 100-packet burst is above any single browser session but far below what a
+# small LAN spikes to - tune in README.
+#
+# rate must be a plain literal in nft; the values below were chosen for the
+# 128MB RM2100 (few dozen devices max).
+chain campus_synrate {
+	type filter hook forward priority filter - 4; policy accept;
+	iifname "br-lan" oifname != "lo" tcp flags syn ct state new meter campus_synrate4 { ip saddr limit rate over 40/second burst 100 packets } counter drop comment "campus-fix: per-host SYN rate limit"
+}
+
+# ------------------------------------------------------------ conn limit
+# Mechanism: flow-count statistics. A single PC holds O(300) concurrent
+# connections at worst (P2P aside); a NAT'd LAN looks like an office. Cap
+# concurrent tracked flows per LAN host. This replaces the commented-out
+# campus_flowcap block from 20-campus-egress-hygiene.nft (kept there for
+# reference; this one is ON by default).
+#
+# ct count inside a dynamic set: the set entry holds the per-source flow
+# count; "ct count over N" is evaluated per packet against the total
+# conntrack entries FROM that source. 500 covers every normal use (a single
+# game console + store downloads included); heavy P2P hosts will feel it.
+# NOTE: the set is declared AFTER the chain that references it - nft parses
+# the whole file (declaration order does not matter, same as the v2.x
+# optional flowcap block in 20-campus-egress-hygiene.nft).
+set campus_conn4 {
+	type ipv4_addr
+	flags dynamic
+	timeout 1h
+}
+
+chain campus_connlimit {
+	type filter hook forward priority filter - 3; policy accept;
+	iifname "br-lan" oifname != "lo" ct state new update @campus_conn4 { ip saddr ct count over 500 } counter drop comment "campus-fix: per-host concurrent flow cap"
+}
