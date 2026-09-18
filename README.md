@@ -3,7 +3,7 @@
 红米 RM AC2100（MediaTek MT7621A，128MB RAM / 16MB flash）专用 OpenWrt 固件，
 内置**校园网多设备检测规避**套件，通过 GitHub Actions 云端构建，本机无需 Linux 环境。
 
-**当前固件版本：v2.7.3**（刷入后 `cat /etc/campus-fix-version` 查询；LuCI 页脚也显示 `campus-fix vX.Y.Z`）
+**当前固件版本：v2.7.4**（刷入后 `cat /etc/campus-fix-version` 查询；LuCI 页脚也显示 `campus-fix vX.Y.Z`）
 
 ## 功能总览
 
@@ -62,8 +62,10 @@
 
 - **自动登录**：填学号密码并启用后，后台守护进程每 90 秒（可调）检测一次；
   被踢下线后自动重新认证，无需手动开认证页
-- **检测机制**：未认证时任意 HTTP 请求会被劫持到 10.0.0.1——探测不到劫持即视为在线，
-  不会反复发认证请求（避免行为异常）
+- **检测机制**：未认证时 AC 劫持任意 80 端口请求（探测点 3.3.3.3/10.0.0.1，
+  3.3.3.3 为校方公告的 portal 入口）；在线判定以「ping qq.com 域名解析通」
+  为第一信号（未认证与停机时 DNS 均死、但 ping IP 均通——ICMP 对 IP 永远
+  不能当在线依据），HTTP generate_204 为兜底
 - **手动操作**：页面提供「登录/下线」按钮即时操作，实时显示认证状态
 - **凭据安全**：学号密码存在 `/etc/config/campusauth`（权限 0600，仅 root 可读）
 - **认证协议**：GET `quickauth.do`（明文 HTTP，该校部署未启用 RSA 加密）；
@@ -81,7 +83,7 @@
 ## 使用方法
 
 1. **构建**：本仓库已配好 Actions。进 **Actions → Build RM AC2100 OpenWrt
-   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.7.3）直接 Run，
+   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.7.4）直接 Run，
    约 3-5 分钟出包。可调输入：
    - `openwrt_version`：OpenWrt 底包版本
    - `include_luci`：是否带 LuCI（false = 纯 CLI，省内存）
@@ -114,7 +116,7 @@
 ## 首次进系统检查清单
 
 ```
-cat /etc/campus-fix-version        # 应显示 2.7.3
+cat /etc/campus-fix-version        # 应显示 2.7.4
 nft list chain inet fw4 campus_ttl_postrouting     # counter 在涨 = TTL 归一生效
 nft list chain inet fw4 campus_quic_block          # drop 在涨 = 有客户端试图 QUIC
 nft list chain inet fw4 campus_leak_block          # 发现协议封锁生效
@@ -150,6 +152,7 @@ uci -q get network.wan.macaddr     # 自定义 WAN MAC（若通过 LuCI 设置�
 |---|---|
 | TTL 改过仍被踢 | v2.7 已覆盖 TTL/IP-ID/DSCP/QUIC/DNS/DHCP/MAC/MSS/流数/速率；再被踢说明检测在 TLS 指纹（JA3）或 UA 层，需终端侧配合（浏览器扩展统一 UA） |
 | 日志刷 "Maximum number of concurrent DNS queries reached" | 上游 DNS 瘫痪时 LAN 客户端重试堆积。v2.7.2 已调 dnsforwardmax=500 + 负缓存 10s 缓解；若仍频繁出现，检查上游 DNS 是否长期不可用（换 223.5.5.5 等公共 DNS 做转发）
+| 手动下线报「下线失败（code=1）」 | v2.7.4 已修：下线请求 portaltype 对齐官方 logout 页的空串（原硬编码 0 被 AC 拒绝）；LuCI 通知现在同时显示服务端 message |
 | 勾选自动认证后不认证、日志报 HTTP dead | v2.7.0-2.7.2 的致命 bug：uclient-fetch **没有** --header 选项，v2.7.0 加上的 --header 让所有请求静默失败（usage 错误被 2>/dev/null 吞掉）→ 探测不到劫持页 → 永远不会走认证路径。v2.7.3 已移除全部 --header 用法 |
 | daemon 报 "HTTP dead, ICMP alive" 但不是停机时段 | v2.7.2 起状态与日志区分「停机时段」与「非停机时段（疑似上游 DNS 故障）」；同时修复移动 WiFi 上级路由占用 10.0.0.1 导致退避永不生效的漏洞（现仅劫持跳转/真实可达才复位退避） |
 | 触发「代理行为」封禁 | v2.7.1 已含守护进程抖动退避 + 请求头补齐（MSS/速率规则因 v2.7.0 事故撤回）；若再次触发，先确认终端是否开着代理/VPN 客户端 |
@@ -204,3 +207,4 @@ files/
 | v2.7.1 | 事故修复：v2.7.0 新增的 `25-campus-connlimit.nft`（MSS clamp/SYN 速率/新流速率三链）导致部分设备首刷后 LAN 完全不通（DHCP 无应答、169.254、ping 不通，breed 重刷无效）——fw4 对 nftables.d drop-in 的 include 是原子加载，规则集在目标内核上失败会让整个 fw4 表起不来，且故障模式超出预期波及了网络面。处置：①整文件回滚（恢复 v2.6.10 已验证规则集）②新增 `89-campus-fw4guard`：S18（先于 fw4 的 S19）启动前用 `fw4 print \| nft -c` 干跑校验完整规则集，失败则把 `/etc/nftables.d/*.nft` 全部隔离到 `/etc/nftables.d.disabled/` 再让 fw4 按原厂配置起网——今后任何规则问题最多损失反检测特性，LAN 永不死；daemon 侧 v2.7.0 的抖动/退避/请求头改动保留（不碰网络面） |
 | v2.7.2 | 三项修复：①页脚 campus-fix 版本号着色（#5e72e4 蓝色加粗 span，与主题链接灰区分；sed 分隔符因颜色值含 # 改用 \|）②自动认证误判修复——18:19 日志复盘：dnsmasq 报 concurrent DNS queries 满（max:150）时 uclient-fetch 域名解析排队超时 → check_online 误报「HTTP dead, ICMP alive（停机）」，且周五非停机时段文案误导；修复：dnsmasq dnsforwardmax 500 + negcachettl 10s（上游 DNS 瘫痪时重试退避）；daemon 状态/日志区分停机（23:00-06:59 粗判）与非停机时段（明确提示疑似上游 DNS 故障且持续探测）；新增 tcp_ok()（nc -z / uclient-fetch 退出码映射）作无 DNS 的 TCP 直连探测；关键漏洞：10.0.0.1 有应答即复位 OFFCAMPUS_STRIKES——移动 WiFi 上级路由常占用 10.0.0.1 管理地址，导致退避永不生效、daemon 永远全速探测外网；现在仅「劫持跳转」或「公网 TCP 真实可达」才复位退避 ③页脚注入幂等测试改用临时目录端到端验证（注入产物/二次运行不叠加均过） |
 | v2.7.3 | 致命 bug 修复：**uclient-fetch 没有 --header 选项**。v2.7.0 为「请求头一致性」给全部 4 处 uclient-fetch 调用加了 --header（daemon fetch/check_online + rpcd fetch/logout），未知长选项使 uclient-fetch 打 usage 并非 0 退出，而 2>/dev/null 把报错吞掉——于是：探测不到 10.0.0.1 劫持跳转（REDIRECT 恒空）→ 永远不走认证路径；check_online 恒失败 → 日志误报「HTTP dead, ICMP alive（停机?）」；LuCI「立即认证」也报「无法获取认证参数」。用户 18:19 日志的真实根因即此（非 DNS 故障——dnsmasq 告警是独立的上游问题，已由 v2.7.2 的 dnsforwardmax=500 缓解）。v2.7.3 移除全部 --header 用法恢复 UA-only 请求；教训入册：uclient-fetch ≠ GNU wget，选项集以 uclient-fetch.c 的 long_opts 为准 |
+| v2.7.4 | 用户实测反馈驱动的三处修复：①劫持探测点改为 3.3.3.3 优先（校方公告的 portal 入口；未认证时 DNS 死→generate_204 域名解析失败→check_online 恒败，且 10.0.0.1 不再保证被劫持，daemon 拿不到跳转就永远进不了认证路径——探测序列改为 3.3.3.3→10.0.0.1，daemon 与 rpcd 手动认证两处同步）②在线判定第一信号改为 ping qq.com（域名解析通=DNS+ICMP 全通=真在线；用户实测未认证时 ping 223.5.5.5 也通——ICMP 对 IP 在未认证/停机两种状态下都放行，绝不能当在线依据；generate_204 降为兜底，保留 HTTP 层信号）③手动下线 code=1 修复：对照 HAR 与 portalUtil.js，官方下线请求 portaltype 是空串（getParam 取不到 logout.html URL 里不存在的参数），v2.7.3 硬编码 '0' 被 AC 拒绝；改为空串并让 LuCI 失败通知附带服务端 message |

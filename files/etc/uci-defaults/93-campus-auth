@@ -227,14 +227,28 @@ fetch() {
 #                  "answered but no hijack" from "unreachable")
 PROBE_REDIRECT=""
 PROBE_HTTP=0
+# hijack probe targets, in order. The AC hijacks ANY http:// request on port
+# 80 while the session is unauthenticated (the campus notice board itself
+# tells users to type http://3.3.3.3 to reach the portal). 10.0.0.1 was the
+# classic hijack gateway but is NOT guaranteed to hijack on every AC config
+# (and foreign networks squat on it); 3.3.3.3 is the campus-documented
+# entry that no legitimate upstream would answer, so a portal.do redirect
+# from it is a near-certain unauthenticated-campus signal.
+HIJACK_PROBES="3.3.3.3 10.0.0.1"
 probe_params() {
-	local body redirect
-	body=$(fetch "http://10.0.0.1/") || body=""
-	[ -n "$body" ] && PROBE_HTTP=1
-	redirect=$(echo "$body" | grep -o 'http://[^"]*portal\.do[^"]*' | head -1)
-	PROBE_REDIRECT="$redirect"
-	[ -n "$redirect" ] || return 1
-	return 0
+	local body redirect p
+	PROBE_REDIRECT=""
+	PROBE_HTTP=0
+	for p in $HIJACK_PROBES; do
+		body=$(fetch "http://$p/") || body=""
+		[ -n "$body" ] && PROBE_HTTP=1
+		redirect=$(echo "$body" | grep -o 'http://[^"]*portal\.do[^"]*' | head -1)
+		if [ -n "$redirect" ]; then
+			PROBE_REDIRECT="$redirect"
+			return 0
+		fi
+	done
+	return 1
 }
 
 # internet reachability check. A plain ICMP probe is NOT enough: this campus
@@ -251,13 +265,24 @@ probe_params() {
 NET_HIJACK=0
 NET_ICMP=0
 check_online() {
-	NET_HIJACK=0; NET_ICMP=0
+	NET_HIJACK=0; NET_ICMP=0; NET_DNS=0
 	local body rc
-	# miui first: China-mobile IP, direct domestic route. ustclug sits
-	# behind Cloudflare, which campus networks rate-limit at peak hours.
-	# While in off-campus backoff these external probes are SKIPPED entirely
-	# (see OFFCAMPUS_STRIKES) - a router on a mobile hotspot must not keep
-	# poking generate_204 endpoints on a metronome.
+	# Layer order (cheapest/most-reliable signal first for THIS campus):
+	#
+	# 1. DNS layer: ping a DOMAIN. The campus force-disconnect AND the
+	#    unauthenticated state both kill DNS (ping qq.com gets nothing),
+	#    so a resolving ping means the full stack (DNS + ICMP) works -
+	#    that only happens when online. This is the user-observable
+	#    definition of "internet works" and needs no HTTP probe at all.
+	#    (ping exits 1 on NXDOMAIN/timeout alike - good enough here.)
+	ping -c 1 -W 4 qq.com >/dev/null 2>&1 && { NET_DNS=1; return 0; }
+	# 2. HTTP layer via generate_204 (still tried when DNS ping failed:
+	#    dnsmasq may hold a cached A record while the DNS forwarder is
+	#    dead, and mobile upstreams resolve but block ICMP). miui first:
+	#    China-mobile IP, direct domestic route; ustclug sits behind
+	#    Cloudflare, which campus networks rate-limit at peak hours.
+	#    While in off-campus backoff these external probes are SKIPPED
+	#    entirely (see OFFCAMPUS_STRIKES).
 	for url in "http://connect.rom.miui.com/generate_204" \
 	           "http://204.ustclug.org/generate_204"; do
 		body=$(uclient-fetch -q -T 8 --user-agent "$UA" -O - "$url" 2>/dev/null)
@@ -277,15 +302,12 @@ check_online() {
 		# non-2xx (8). Could also be "this single endpoint is down" or
 		# "DNS flaky while online" - try the next probe before giving up.
 	done
-	# both HTTP probes dead. Two IP-direct diagnostics (neither needs DNS):
-	#   NET_ICMP  ICMP echo to a public IP
-	#   NET_TCP53 TCP handshake to 223.5.5.5:53 (Ali public DNS, TCP-open
-	#             network-wide). Distinguishes "IP layer alive" from "ICMP
-	#             merely not filtered" - some mobile/hotspot upstreams drop
-	#             ICMP entirely while passing TCP just fine, and conversely
-	#             a force-disconnected campus passes ICMP but kills TCP.
-	# Neither is an online signal on its own (HTTP is); they only refine
-	# the failure status text.
+	# 3. both HTTP probes dead. IP-direct diagnostics (neither needs DNS):
+	#   NET_ICMP  ICMP echo to a public IP - NOT an online signal: the
+	#             unauthenticated campus passes ICMP to IPs while killing
+	#             HTTP+DNS (user-verified: unauthenticated, ping 223.5.5.5
+	#             OK, ping qq.com dead, http://3.3.3.3 hijacked to portal).
+	#             Pure failure-text refinement.
 	ping -c 1 -W 3 223.5.5.5 >/dev/null 2>&1 && NET_ICMP=1
 	return 1
 }
@@ -459,17 +481,16 @@ while true; do
 		fi
 		# Off-campus scoring. Counting a strike when the campus network is
 		# nowhere in sight:
-		#   - gateway silent (PROBE_HTTP=0): clearly not on the campus net
-		#   - gateway ANSWERED but no portal.do redirect AND external HTTP
+		#   - all hijack probes silent (PROBE_HTTP=0): not on the campus net
+		#   - a probe ANSWERED but no portal.do redirect AND external HTTP
 		#     probes also failed: not "authenticated and online" (that
-		#   would have returned in the check_online branches above) - this
-		#   is a foreign router squatting on 10.0.0.1 (mobile hotspots and
-		#   carrier gateways love that address) with a broken/slow DNS
-		#   upstream. v2.7.1 and earlier reset the backoff on ANY 10.0.0.1
-		#   answer, so a mobile-WiFi upstream kept the daemon probing at
-		#   full cadence forever (log: "HTTP dead, ICMP alive" every cycle
-		#   plus dnsmasq concurrent-query floods). Only a hijack redirect
-		#   or a working internet resets the counter now.
+		#     would have returned in the check_online branches above) - a
+		#     foreign router squatting on the probe IP (mobile hotspots
+		#     and carrier gateways love 10.0.0.1) with a broken/slow DNS
+		#     upstream. v2.7.1 and earlier reset the backoff on ANY probe
+		#     answer, so a mobile-WiFi upstream kept the daemon probing at
+		#     full cadence forever. Only a hijack redirect or a working
+		#     internet resets the counter now.
 		if [ "$PROBE_HTTP" != "1" ]; then
 			OFFCAMPUS_STRIKES=$(( OFFCAMPUS_STRIKES + 1 ))
 		elif [ "$NET_HIJACK" != "1" ] && ! tcp_ok 223.5.5.5 53; then
@@ -658,9 +679,16 @@ return {
 				if (!userid || !passwd)
 					return { code: null, error: '学号或密码未设置' };
 
-				// probe hijack gateway for session params
-				let body = fetch('http://10.0.0.1/');
-				let redirect = match(body ?? '', /http:\/\/[^"']*portal\.do\?[^"']*/);
+				// probe hijack targets for session params (same order and
+				// rationale as the daemon's HIJACK_PROBES: 3.3.3.3 first -
+				// the campus-documented portal entry - then 10.0.0.1)
+				let redirect = null;
+				for (let probe in ['3.3.3.3', '10.0.0.1']) {
+					let body = fetch('http://' + probe + '/');
+					redirect = match(body ?? '', /http:\/\/[^"']*portal\.do\?[^"']*/);
+					if (redirect)
+						break;
+				}
 				if (!redirect)
 					return { code: null, error: '无法获取认证参数（可能已在线或网关不可达）' };
 
@@ -725,12 +753,17 @@ return {
 				let url = 'http://' + portal_ip + '/quickauthdisconn.do';
 				// no --header here either: uclient-fetch rejects it (see
 				// fetch() above) and the logout would silently fail
+				//
+				// portaltype: the stock logout page sends getParam('portaltype')
+				// which is ABSENT from the logout.html URL - i.e. an EMPTY
+				// string. v2.7.3 and earlier hard-coded '0' here and the AC
+				// answered code=1 (下线失败); mirror the stock client exactly.
 				let cmd = 'uclient-fetch -q -T 8 --user-agent ' + q + UA + q +
 					' --post-data=' + q +
 					'wlanacip=' + (p.wlanacip ?? '10.1.110.3') +
 					'&wlanuserip=' + (p.wlanuserip ?? '') +
 					'&wlanacname=' + (p.wlanacname ?? '') +
-					'&version=0&portaltype=0&userid=' + userid +
+					'&version=0&portaltype=&userid=' + userid +
 					'&mac=' + (p.mac ?? '') + '&groupId=' + (args?.groupId ?? '2') +
 					q + ' -O - ' + q + url + q + ' 2>/dev/null';
 				let exec = popen(cmd);
@@ -929,7 +962,11 @@ return view.extend({
 					ui.addNotification(null, _('已下线。'), 'info');
 				}
 				else {
-					ui.addNotification(null, _('下线失败（code=%s）').format(ret ? ret.code : '?'), 'error');
+					// surface the portal's own message alongside the code:
+					// "code=1" alone told us nothing while debugging the
+					// portaltype mismatch (v2.7.4)
+					var why = (ret && ret.message) ? _('：%s').format(ret.message) : '';
+					ui.addNotification(null, _('下线失败（code=%s）%s').format(ret ? ret.code : '?', why), 'error');
 				}
 			});
 		};
