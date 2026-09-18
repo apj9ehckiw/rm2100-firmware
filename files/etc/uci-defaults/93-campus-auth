@@ -677,7 +677,12 @@ var callLogout = rpc.declare({
 // HH:MM validation. NOTE: LuCI 24.10 has no 'time' datatype (only
 // 'timehhmmss'); an unknown datatype name makes Validator.compile throw
 // SyntaxError and kills the whole form, so validate via o.validate.
-function validateHHMM(value) {
+// Signature is validate(section_id, value) - the framework binds the
+// section id as the FIRST argument (getValidator does
+// L.bind(this.validate, this, section_id) and validation.js then calls
+// vfunc(value)), so a single-parameter f(value) receives the section id
+// ('login') instead of the input and rejects every well-formed time.
+function validateHHMM(section_id, value) {
 	if (value == null || value == '')
 		return true;
 	if (!/^(2[0-3]|[01][0-9]):[0-5][0-9]$/.test(value))
