@@ -1,0 +1,65 @@
+#!/bin/sh
+# campus-fix v2.7.1: fw4 health self-check on first boot.
+#
+# Background (v2.7.0 postmortem): a drop-in under /etc/nftables.d/ that fails
+# to load on the TARGET kernel makes fw4 abort loading the whole inet fw4
+# table. fw4's nftables.d include is atomic - one bad rule and the entire
+# table is gone. v2.7.0 shipped a ruleset that CI (nft -c, userspace 1.0.9)
+# accepted but the router still ended up with a dead LAN (breed reflash of
+# kernel1+rootfs0 did not help, so the failure was somewhere in first-boot
+# service bring-up, not in flash wear). Whatever the exact culprit turns out
+# to be, the router must NEVER lose its LAN over a filter rule again.
+#
+# Mechanism: run LATE in uci-defaults (number 89, after all other scripts
+# have written their files but the firewall has not necessarily started
+# yet - fw4 starts at S19, uci-defaults at S10, so at this point we cannot
+# test the real load. Instead we arm a boot-time check).
+#
+# The real check runs as an init script ordered BEFORE fw4 (START=18):
+#   - if /etc/nftables.d/*.nft exists, try `fw4 restart`
+#   - if it fails, move ALL drop-ins to /etc/nftables.d.disabled/ and
+#     `fw4 restart` again - this second attempt must succeed (stock fw4
+#     without drop-ins is the upstream default and always loads)
+#   - log loudly either way (logread -e campus-fw4guard)
+#
+# Result: worst case (a broken drop-in) the router comes up with the stock
+# firewall + NAT - internet works, LuCI works, only the campus anti-
+# detection extras are off. The failure is visible in the log instead of
+# being a dead LAN.
+
+mkdir -p /etc/init.d
+cat > /etc/init.d/campus-fw4guard <<'GUARDEOF'
+#!/bin/sh /etc/rc.common
+# campus-fix v2.7.1: quarantine broken nftables.d drop-ins before fw4 loads.
+# fw4 includes /etc/nftables.d/*.nft atomically - one rule the kernel
+# rejects and the whole fw4 table fails to load. This guard tries a dry-run
+# load first; on failure it moves every drop-in aside and leaves fw4 with
+# the stock ruleset so the LAN always comes up.
+START=18
+
+start_service() {
+	# no drop-ins -> nothing to guard
+	ls /etc/nftables.d/*.nft >/dev/null 2>&1 || return 0
+
+	# Dry-run the full ruleset fw4 would load. fw4 print emits the
+	# complete nft file (including the nftables.d includes); feed it to
+	# `nft -c -f -` for a syntax+semantic check without touching the
+	# running ruleset. -c still consults the kernel for some
+	# expressions, which is exactly what we want (the v2.7.0 failure
+	# mode was userspace-OK-kernel-NO).
+	if ! fw4 print 2>/dev/null | nft -c -f - >/dev/null 2>&1; then
+		logger -t campus-fw4guard "fw4 ruleset FAILED dry-run; quarantining /etc/nftables.d drop-ins"
+		mkdir -p /etc/nftables.d.disabled
+		mv /etc/nftables.d/*.nft /etc/nftables.d.disabled/ 2>/dev/null
+		logger -t campus-fw4guard "drop-ins moved to /etc/nftables.d.disabled - router runs stock firewall; check logread for the failing rule"
+	else
+		logger -t campus-fw4guard "fw4 ruleset dry-run OK"
+	fi
+}
+GUARDEOF
+chmod +x /etc/init.d/campus-fw4guard
+
+# fw4's own init is START=19 (S19firewall). Our guard must run first.
+/etc/init.d/campus-fw4guard enable
+
+exit 0
