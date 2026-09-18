@@ -23,6 +23,18 @@ uci -q commit network
 # segment (e.g. a roommate's box in promiscuous mode) sees uniform DHCP
 # replies instead of dnsmasq defaults. It does NOT touch client DISCOVERs.
 uci -q add_list dhcp.lan.dhcp_option='option:vendor-class,"MSFT 5.0"'
+
+# 3) dnsmasq resilience against upstream DNS outages (v2.7.2). When the
+#    upstream resolver dies or goes slow (campus DNS at peak hours, or a
+#    mobile-WiFi upstream), LAN clients re-query aggressively and pile up:
+#    "Maximum number of concurrent DNS queries reached (max: 150)" - after
+#    which dnsmasq drops NEW queries on the floor, including the auth
+#    daemon's own lookups, which then misreads the state as "HTTP dead".
+#    Raise the concurrent ceiling and serve a short stale cache so bursts
+#    of identical names hit the cache instead of the upstream.
+uci -q set dhcp.@dnsmasq[0].dnsforwardmax='500'
+# negative/failed lookups cached 10s: retries back off instead of hammering
+uci -q set dhcp.@dnsmasq[0].negcachettl='10'
 uci -q commit dhcp
 
 exit 0

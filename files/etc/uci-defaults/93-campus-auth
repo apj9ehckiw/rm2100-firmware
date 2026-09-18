@@ -195,6 +195,21 @@ in_active_window() {
 	fi
 }
 
+# Rough "force-disconnect hours" guess for STATUS TEXT ONLY (never gates
+# behavior): the campus cuts HTTP+DNS on weeknights from ~23:30; recovery
+# around 06:30. Outside those hours an HTTP-dead-with-ICMP-alive result is
+# more likely an upstream DNS outage (see dnsmasq concurrent-query floods)
+# than the scheduled disconnect - the status text should say so instead of
+# blaming the disconnect window at, say, Friday 18:19.
+looks_like_maintenance_window() {
+	local h
+	h=$(date '+%H')
+	case "$h" in
+		23|00|01|02|03|04|05|06) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
 # fetch url -> stdout (uclient-fetch; wget is its alias on OpenWrt).
 # Accept-Language mirrors the real browser capture so the request isn't
 # "Chrome UA with a bare header set" - a classic scripted-client tell.
@@ -268,11 +283,35 @@ check_online() {
 		# non-2xx (8). Could also be "this single endpoint is down" or
 		# "DNS flaky while online" - try the next probe before giving up.
 	done
-	# both HTTP probes dead. ICMP as a diagnostic ONLY (never as the online
-	# signal): distinguishes the force-disconnect window (ICMP alive, HTTP+
-	# DNS dead) from a total outage (cable pulled, gateway down).
+	# both HTTP probes dead. Two IP-direct diagnostics (neither needs DNS):
+	#   NET_ICMP  ICMP echo to a public IP
+	#   NET_TCP53 TCP handshake to 223.5.5.5:53 (Ali public DNS, TCP-open
+	#             network-wide). Distinguishes "IP layer alive" from "ICMP
+	#             merely not filtered" - some mobile/hotspot upstreams drop
+	#             ICMP entirely while passing TCP just fine, and conversely
+	#             a force-disconnected campus passes ICMP but kills TCP.
+	# Neither is an online signal on its own (HTTP is); they only refine
+	# the failure status text.
 	ping -c 1 -W 3 223.5.5.5 >/dev/null 2>&1 && NET_ICMP=1
 	return 1
+}
+
+# TCP handshake check without DNS: uses busybox nc if present, else a
+# uclient-fetch to the telnet-style port as a last resort. Returns 0 when
+# the TCP connection to $1:$2 could be established.
+tcp_ok() {
+	if command -v nc >/dev/null 2>&1; then
+		nc -z -w 3 "$1" "$2" >/dev/null 2>&1 && return 0
+		return 1
+	fi
+	# no nc: uclient-fetch against the DNS-over-TCP port; any TCP-level
+	# response (even a protocol error exit) means the handshake worked.
+	# exit 4 = connection failed/timeout, exit 8/0 = server answered.
+	uclient-fetch -q -T 3 -O /dev/null "http://$1:$2/" >/dev/null 2>&1
+	case $? in
+		0|8) return 0 ;;
+		*) return 1 ;;
+	esac
 }
 
 # GET PortalJsonAction.do and echo raw JSON
@@ -393,17 +432,28 @@ while true; do
 			# moment the AC starts hijacking again (network is back).
 			AUTH_OK=0
 			if [ "$NET_ICMP" = "1" ]; then
-				set_status "disconnected（HTTP/DNS 已断（疑似停机），ICMP 仍通；恢复后自动重连） $(date '+%Y-%m-%d %H:%M:%S')"
+				if looks_like_maintenance_window; then
+					set_status "disconnected（HTTP/DNS 已断（疑似停机时段），ICMP 仍通；恢复后自动重连） $(date '+%Y-%m-%d %H:%M:%S')"
+				else
+					set_status "disconnected（HTTP/DNS 已断（非停机时段：疑似上游 DNS 故障或网络异常），ICMP 仍通；持续探测中） $(date '+%Y-%m-%d %H:%M:%S')"
+				fi
 			else
 				set_status "disconnected（外网完全不可达；恢复后自动重连） $(date '+%Y-%m-%d %H:%M:%S')"
 			fi
-			log "online->disconnected: HTTP probes dead (icmp=$NET_ICMP; force-disconnect window?)"
+			log "online->disconnected: HTTP probes dead (icmp=$NET_ICMP; maintenance_window=$(looks_like_maintenance_window && echo yes || echo no))"
 		elif [ "$NET_ICMP" = "1" ]; then
 			# never authenticated this session and HTTP is dead while ICMP
-			# answers: force-disconnect window (or DNS outage) - not an
-			# auth problem. Nothing to try until the network returns.
-			set_status "disconnected（HTTP/DNS 已断（疑似停机），ICMP 仍通） $(date '+%Y-%m-%d %H:%M:%S')"
-			log "HTTP dead, ICMP alive (force-disconnect window?); not an auth issue"
+			# answers. Inside maintenance hours: the scheduled disconnect.
+			# Outside them (e.g. a Friday evening): an upstream DNS outage
+			# or upstream filter - either way not an auth problem and not
+			# something a login attempt would fix. Keep probing.
+			if looks_like_maintenance_window; then
+				set_status "disconnected（HTTP/DNS 已断（疑似停机时段），ICMP 仍通） $(date '+%Y-%m-%d %H:%M:%S')"
+				log "HTTP dead, ICMP alive (maintenance window); not an auth issue"
+			else
+				set_status "disconnected（HTTP/DNS 已断（非停机时段：疑似上游 DNS 故障），ICMP 仍通；持续探测中） $(date '+%Y-%m-%d %H:%M:%S')"
+				log "HTTP dead, ICMP alive (outside maintenance hours - upstream DNS outage?); keep probing"
+			fi
 		elif [ "$PROBE_HTTP" = "1" ]; then
 			# gateway answered but no portal.do redirect and no internet:
 			# portal moved or hijack format changed - worth a log line
@@ -413,10 +463,24 @@ while true; do
 			set_status "offline（网关不可达，外网不通） $(date '+%Y-%m-%d %H:%M:%S')"
 			log "hijack gateway probe failed (gateway down or portal moved)"
 		fi
-		# gateway fully silent AND no hijack: could be off-campus (mobile
-		# hotspot) or total outage. Count it toward the off-campus backoff;
-		# a reachable campus gateway resets the counter in the next round.
+		# Off-campus scoring. Counting a strike when the campus network is
+		# nowhere in sight:
+		#   - gateway silent (PROBE_HTTP=0): clearly not on the campus net
+		#   - gateway ANSWERED but no portal.do redirect AND external HTTP
+		#     probes also failed: not "authenticated and online" (that
+		#   would have returned in the check_online branches above) - this
+		#   is a foreign router squatting on 10.0.0.1 (mobile hotspots and
+		#   carrier gateways love that address) with a broken/slow DNS
+		#   upstream. v2.7.1 and earlier reset the backoff on ANY 10.0.0.1
+		#   answer, so a mobile-WiFi upstream kept the daemon probing at
+		#   full cadence forever (log: "HTTP dead, ICMP alive" every cycle
+		#   plus dnsmasq concurrent-query floods). Only a hijack redirect
+		#   or a working internet resets the counter now.
 		if [ "$PROBE_HTTP" != "1" ]; then
+			OFFCAMPUS_STRIKES=$(( OFFCAMPUS_STRIKES + 1 ))
+		elif [ "$NET_HIJACK" != "1" ] && ! tcp_ok 223.5.5.5 53; then
+			# 10.0.0.1 answered, no hijack, and even TCP to a public IP
+			# fails -> foreign network or dead upstream: back off.
 			OFFCAMPUS_STRIKES=$(( OFFCAMPUS_STRIKES + 1 ))
 		else
 			OFFCAMPUS_STRIKES=0
