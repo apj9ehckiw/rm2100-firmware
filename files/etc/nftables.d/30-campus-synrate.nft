@@ -1,0 +1,37 @@
+# campus-fix v2.9: aggregate LAN SYN rate cap (fw4 nftables drop-in)
+#
+# Single-rule greylist increment (v2.7.0 incident policy: one rule at a time;
+# fw4guard boot dry-run quarantines ALL drop-ins on failure, so the worst
+# case is "this rule silently off", never a dead LAN).
+#
+# Mechanism: N devices behind one NAT IP produce an aggregate new-connection
+# (SYN) rate that a single host rarely reaches - bursty page loads from
+# several devices overlap, and campus flow profilers use exactly that burst
+# shape as a "proxy behavior" signal. This caps the AGGREGATE rate of
+# LAN-originated SYNs to a single-host-plausible envelope.
+#
+# Why stateless `limit` and NOT a meter / ct-count-in-set:
+#   - `limit` is per-rule global: one token bucket for the whole bridge,
+#     which is exactly the post-NAT traffic shape the campus sees (per-host
+#     meters would cap each LAN client separately and leave the aggregate
+#     untouched)
+#   - the limit expression is ancient core nft with universal kernel
+#     support; v2.7.0's ct-count-in-set passed CI `nft -c` but was rejected
+#     by the target kernel (CI cannot catch kernel-semantic rejection)
+#
+# Thresholds: 40 SYN/s sustained, 100-packet burst allowance. A single busy
+# browser bursts ~30-60 SYNs on a heavy page load; the burst bucket absorbs
+# that untouched. Sustained rates above 40/s only happen with parallel
+# downloaders / multi-device storms. Excess SYNs are dropped and TCP
+# retransmits after ~1s, so exceeding the cap degrades to mild latency,
+# never a broken connection.
+#
+# Deliberately NOT in this increment (rejected):
+#   - per-host meters (ip saddr key): campus only sees the aggregate
+#   - new-flow-per-minute ct counters: kernel-support risk (v2.7.0)
+#   - TCP window-size / option-order rewriting: not expressible in nftables
+
+chain campus_synrate {
+	type filter hook forward priority filter - 8; policy accept;
+	iifname "br-lan" tcp flags & (syn | ack) == syn limit rate over 40/second burst 100 packets counter drop comment "campus-fix: aggregate LAN SYN rate cap (smooth multi-device burst signature)"
+}

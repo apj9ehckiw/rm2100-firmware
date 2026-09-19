@@ -1,6 +1,6 @@
 #!/bin/sh
 # campus-fix v2.3: version stamp (queried via: cat /etc/campus-fix-version)
-echo "2.8.1" > /etc/campus-fix-version
+echo "2.9.0" > /etc/campus-fix-version
 
 # Replace default banner with campus-fix usage notes
 cat > /etc/banner <<EOF
@@ -14,6 +14,7 @@ cat > /etc/banner <<EOF
    QUIC UDP/443  -> DROP          (nft list chain inet fw4 campus_quic_block)
    fw4 guard     -> ruleset dry-run at boot, quarantine on failure (logread -e campus-fw4guard)
    MSS           -> clamp to PMTU (greylisted return, guarded; nft list chain inet fw4 campus_mss_clamp)
+   SYN rate      -> aggregate LAN cap 40/s burst 100 (nft list chain inet fw4 campus_synrate)
    DNS           -> forced to system resolver (dnsmasq, no client bypass)
    DoT 853       -> DROP            (campus_leak_block)
    NetBIOS/SMB/SSDP/mDNS/LLMNR egress -> DROP (campus_leak_block)

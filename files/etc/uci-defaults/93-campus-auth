@@ -84,22 +84,31 @@ cat > /usr/bin/campus-auth <<'DAEMONEOF'
 # LuCI edits take effect even if the procd reload trigger chain fails.
 
 STATUS_FILE=/tmp/campus-auth.status
+# ban persistence: the AC's proxy-behavior ban is MAC-keyed and survives
+# daemon/router restarts. Keeping BAN_UNTIL only in memory meant a procd
+# respawn (or a reboot) walked straight back into quickauth during the ban -
+# and each attempt during a ban RE-MARKS the MAC (v2.8.0 note). Persist the
+# expiry epoch so any restarted daemon stays silent until it lapses.
+BAN_UNTIL_FILE=/tmp/campus-auth.banuntil
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
 log() { logger -t campus-auth "$1"; }
 set_status() { echo "$1" > "$STATUS_FILE"; }
 
 # sleep with human-like jitter: a fixed 90s loop is a stopwatch signature.
-# ±20% around the configured interval (bounded 5..600s).
+# v2.9: widened to ±35% (was ±20%) - with the steady-state probe traffic
+# removed, the sleep cadence itself is the last periodic signature left;
+# ±20% of 90s still clusters tightly around 90, ±35% spreads 58..122s.
 jittered_sleep() {
 	local base jitter s
 	base=${1:-90}
 	case "$base" in ''|*[!0-9]*) base=90 ;; esac
-	jitter=$(( base / 5 ))
+	jitter=$(( base * 7 / 20 ))
 	[ "$jitter" -lt 1 ] && jitter=1
-	# busybox 无 $RANDOM：用 PID+秒数的低位混合，凑一个 0..2*jitter 的散布
-	s=$(( ( $$ * 7 + $(date +%S) * 13 ) % ( jitter * 2 + 1 ) - jitter ))
-	[ "$s" -lt 0 ] && s=0
+	# busybox 无 $RANDOM：用 PID+秒/分的低位混合，凑一个 -jitter..+jitter 的散布
+	s=$(( ( $$ * 7 + $(date +%S) * 13 + $(date +%M) * 29 ) % ( jitter * 2 + 1 ) - jitter ))
+	# NOTE: 不再把负 s 钳成 0（v2.7.0~v2.8.1 的老 bug：钳位后只剩单侧
+	# +0~+20% 抖动，基准值仍高度可预测）。下限由最后一行的 sleep 三元保护。
 	sleep $(( base + s > 5 ? base + s : 5 ))
 }
 
@@ -283,6 +292,20 @@ probe_params() {
 	return 1
 }
 
+# Cached wrapper around check_online for cycles where the steady-state
+# pre-check already ran it (see main loop). Re-running the full probe set
+# twice in one cycle doubles the periodic external footprint for zero new
+# information - the NET_HIJACK/NET_ICMP globals from the pre-check run are
+# still valid within the same iteration.
+PRECHECK_RAN=0
+PRECHECK_RC=1
+check_online_cached() {
+	if [ "$PRECHECK_RAN" = "1" ]; then
+		return "$PRECHECK_RC"
+	fi
+	check_online
+}
+
 # internet reachability check. A plain ICMP probe is NOT enough: this campus
 # force-disconnects users on weeknights (23:30+) while leaving ICMP to public
 # IPs reachable - ping 223.5.5.5 answers while HTTP and DNS are both dead
@@ -382,6 +405,20 @@ json_get() {
 AUTH_OK=0
 ONLINE_STAMP=0
 
+# restore a persisted ban (MAC-keyed AC bans survive daemon restarts):
+# without this, procd respawn after a crash / `service campus-auth restart`
+# / reboot walks straight back into quickauth mid-ban and re-marks the MAC.
+BAN_UNTIL=0
+if [ -f "$BAN_UNTIL_FILE" ]; then
+	BAN_UNTIL=$(cat "$BAN_UNTIL_FILE" 2>/dev/null)
+	case "$BAN_UNTIL" in ''|*[!0-9]*) BAN_UNTIL=0 ;; esac
+	if [ "$BAN_UNTIL" -gt 0 ] && [ "$(date +%s)" -ge "$BAN_UNTIL" ]; then
+		BAN_UNTIL=0
+		rm -f "$BAN_UNTIL_FILE"
+	fi
+	[ "$BAN_UNTIL" -gt 0 ] && log "resumed persisted ban (until $(date -d @${BAN_UNTIL} '+%H:%M:%S' 2>/dev/null || date '+%H:%M:%S'))"
+fi
+
 while true; do
 	# re-read settings each cycle: LuCI edits apply within one interval even
 	# if the procd reload trigger chain fails for whatever reason
@@ -409,6 +446,50 @@ while true; do
 		set_status "paused（超出运行时段 ${ACTIVE_START}-${ACTIVE_END}，暂停探测） $(date '+%Y-%m-%d %H:%M:%S')"
 		sleep "$INTERVAL"
 		continue
+	fi
+
+	# --- persisted-ban gate -------------------------------------------
+	# The AC's proxy-behavior ban is keyed to the WAN MAC and survives
+	# everything on our side. While it stands, the correct posture is the
+	# same as the inline ban sleep in the auth path below: total silence -
+	# no hijack probes, no generate_204, no quickauth. Probing looks like
+	# ordinary browser traffic and does not lift the ban; authenticating
+	# does and re-marks the MAC.
+	if [ "$BAN_UNTIL" -gt 0 ]; then
+		if [ "$(date +%s)" -ge "$BAN_UNTIL" ]; then
+			BAN_UNTIL=0
+			rm -f "$BAN_UNTIL_FILE"
+			set_status "ban-expired（代理行为封禁已到期，恢复正常认证流程） $(date '+%Y-%m-%d %H:%M:%S')"
+			log "ban expired; resuming normal auth flow"
+		else
+			set_status "banned（代理行为封禁静默期，至 $(date -d @${BAN_UNTIL} '+%H:%M:%S' 2>/dev/null || date '+%H:%M:%S')；期间零探测零认证，勿手动登录） $(date '+%Y-%m-%d %H:%M:%S')"
+			jittered_sleep $(( INTERVAL > 60 ? INTERVAL : 60 ))
+			continue
+		fi
+	fi
+
+	# --- steady-state fast path ---------------------------------------
+	# v2.9: when we are already online, one ping to qq.com per cycle is the
+	# ONLY steady-state probe. Previously every cycle ran probe_params (two
+	# hijack HTTP probes - the AC answers authenticated sessions with a
+	# portalLogout.do redirect, so this traffic never looked like a human
+	# browser) plus a duplicated check_online in the pre-auth branch. With
+	# the fast path a healthy session emits: 1 DNS query + 1 ICMP echo,
+	# jittered ±35% - indistinguishable from OS-level captive-portal checks.
+	# Skipped while off-campus backoff is active (strikes >= 3): external
+	# probes must stay fully silent there, and the backoff branch below
+	# still runs its cheap gateway probe first.
+	PRECHECK_RAN=0
+	if [ "$OFFCAMPUS_STRIKES" -lt 3 ] && [ "$AUTH_OK" = "1" ]; then
+		check_online
+		PRECHECK_RC=$?
+		PRECHECK_RAN=1
+		if [ "$PRECHECK_RC" -eq 0 ]; then
+			ONLINE_STAMP=$(date +%s)
+			set_status "online(稳态) $(date '+%Y-%m-%d %H:%M:%S')"
+			jittered_sleep "$INTERVAL"
+			continue
+		fi
 	fi
 
 	# off-campus backoff: after several consecutive rounds where the
@@ -454,13 +535,13 @@ while true; do
 		REDIRECT="$PROBE_REDIRECT"
 	fi
 	if [ -z "$REDIRECT" ]; then
-		if [ "$AUTH_OK" = "1" ] && check_online; then
+		if [ "$AUTH_OK" = "1" ] && check_online_cached; then
 			# authenticated earlier and HTTP layer still works: stay online.
 			# check_online each cycle (not just on first detection) - the
 			# campus force-disconnects on weeknights while ICMP stays up,
 			# which a ping-only check would misreport as online.
 			set_status "online(no-hijack) $(date '+%Y-%m-%d %H:%M:%S')"
-		elif [ "$AUTH_OK" != "1" ] && check_online; then
+		elif [ "$AUTH_OK" != "1" ] && check_online_cached; then
 			# hijack gone AND internet reachable: silently authenticated
 			# (MAC auth) or otherwise exempted - nothing to do
 			AUTH_OK=1; ONLINE_STAMP=$(date +%s)
@@ -556,7 +637,10 @@ while true; do
 	# the behavior anomaly this daemon must avoid, so confirm we actually
 	# CANNOT reach the internet before authenticating. ping qq.com first
 	# (cheap, no HTTP), generate_204 fallback inside check_online.
-	if check_online; then
+	# Cached when the steady-state pre-check already ran it this cycle -
+	# the verdict cannot change within seconds and a second full probe
+	# round doubles the external footprint for nothing.
+	if check_online_cached; then
 		AUTH_OK=1; ONLINE_STAMP=$(date +%s)
 		set_status "online(劫持探测但外网可达，判定已在线) $(date '+%Y-%m-%d %H:%M:%S')"
 		jittered_sleep "$INTERVAL"
@@ -607,9 +691,13 @@ while true; do
 		esac
 		if [ "$BAN_SECONDS" -gt 0 ]; then
 			BAN_UNTIL=$(( $(date +%s) + BAN_SECONDS + 60 ))  # +60s margin
+			# persist: the AC ban is MAC-keyed and outlives the daemon -
+			# a crash/respawn/reboot must not walk back into quickauth
+			echo "$BAN_UNTIL" > "$BAN_UNTIL_FILE"
 			set_status "banned（触发代理行为检测：${MSG}；认证禁至 $(date -d @${BAN_UNTIL} '+%H:%M:%S' 2>/dev/null || date '+%H:%M:%S')，期间静默不再尝试，到期自动恢复） $(date '+%Y-%m-%d %H:%M:%S')"
 			log "auth banned by AC for ${BAN_MIN}min (proxy-behavior detection); going silent"
-			# sleep in slices so uci edits (disable/interval) still apply
+			# sleep in slices so uci edits (disable/interval) still apply;
+			# the loop-top persisted-ban gate takes over if we respawn
 			BAN_LEFT=$BAN_SECONDS
 			while [ "$BAN_LEFT" -gt 0 ]; do
 				jittered_sleep $(( BAN_LEFT > 300 ? 300 : BAN_LEFT ))
@@ -769,6 +857,29 @@ return {
 
 				if (!userid || !passwd)
 					return { code: null, error: '学号或密码未设置' };
+
+				// persisted-ban guard: the AC ban is MAC-keyed and every
+				// quickauth attempt during it re-marks the MAC. The daemon
+				// goes silent, but the LuCI "立即认证" button is user-driven -
+				// block it here too so a well-meaning click cannot extend
+				// the punishment.
+				// NOTE: no ucode time builtins (time()/localtime() signatures
+				// differ across libucode versions) - shell out to date, which
+				// the daemon itself uses for the same arithmetic.
+				// int('') returns null and null < N is numerically TRUE in
+				// ucode, so both sides must be null-checked or a popen
+				// failure would wrongly block login forever.
+				let ban_until = trim(readfile('/tmp/campus-auth.banuntil') ?? '');
+				if (ban_until && match(ban_until, /^[0-9]+$/)) {
+					let p = popen('echo "$(date +%s) $(date -d @' + ban_until + ' "+%H:%M:%S" 2>/dev/null)"');
+					let out = trim(p ? (p.read('all') ?? '') : '');
+					if (p) p.close();
+					let parts = split(out, ' ');
+					let now_s = int(parts[0]);
+					let until_s = int(ban_until);
+					if (now_s != null && until_s != null && now_s < until_s)
+						return { code: null, error: '代理行为封禁中（至 ' + (parts[1] ?? '?') + '），请勿重复尝试认证，到期后守护进程自动恢复' };
+				}
 
 				// probe hijack targets for session params (same order and
 				// rationale as the daemon's HIJACK_PROBES: 3.3.3.3 first -
@@ -979,7 +1090,9 @@ return view.extend({
 			'online(already)': _('在线（此前已认证）'),
 			'online(no-hijack)': _('在线（无劫持）'),
 			'online(mac-auth/免认证)': _('在线（免认证）'),
+			'online(稳态)': _('在线'),
 			'banned': _('已被封禁'),
+			'ban-expired': _('封禁已到期'),
 			'maintenance': _('停机时段'),
 			'off-campus': _('非校园网络'),
 			'paused': _('已暂停'),

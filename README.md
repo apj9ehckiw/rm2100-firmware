@@ -3,7 +3,7 @@
 红米 RM AC2100（MediaTek MT7621A，128MB RAM / 16MB flash）专用 OpenWrt 固件，
 内置**校园网多设备检测规避**套件，通过 GitHub Actions 云端构建，本机无需 Linux 环境。
 
-**当前固件版本：v2.8.1**（刷入后 `cat /etc/campus-fix-version` 查询；LuCI 页脚也显示 `campus-fix vX.Y.Z`）
+**当前固件版本：v2.9.0**（刷入后 `cat /etc/campus-fix-version` 查询；LuCI 页脚也显示 `campus-fix vX.Y.Z`）
 
 ## 功能总览
 
@@ -22,8 +22,9 @@
 | WAN MAC | 默认出厂 MAC（不随机化）；LuCI 页面可查/改/克隆/轮换/复原（存 uci） | `95-campus-mac-luci` |
 | IPv6 泄漏 | LAN 默认关 RA/DHCPv6 | `99-campus-fix-banner` |
 | MSS 指纹混合 | WAN 出向 SYN 的 TCP MSS 统一 clamp 到路径 MTU（灰度回归，fw4guard 兜底） | `25-campus-mss.nft` `campus_mss_clamp` |
-| 代理行为封禁识别 | quickauth 应答含「禁用/禁止/代理行为/封禁」即解析分钟数，banned 状态静默到期（重复尝试会加重标记） | `93-campus-auth` |
-| 探测行为签名 | 认证守护进程间隔随机抖动（±20%）；非校园网环境指数退避并停止外部探测 | `93-campus-auth` |
+| 聚合 SYN 速率 | LAN 全桥聚合新建连接速率上限 40/s（burst 100）：多设备突发叠加是「代理行为」判定的主要速率信号；stateless limit（非 meter/ct-count，避 v2.7.0 内核兼容雷） | `30-campus-synrate.nft` `campus_synrate` |
+| 代理行为封禁识别 | quickauth 应答含「禁用/禁止/代理行为/封禁」即解析分钟数，banned 状态静默到期（重复尝试会加重标记）；封禁截止时间**持久化**——daemon 崩溃重启/路由器重启也不会撞回封禁期，LuCI「立即认证」按钮在封禁期直接拒绝 | `93-campus-auth` |
+| 探测行为签名 | 稳态在线时每周期只剩 1 次 ping qq.com（劫持探测/generate_204 仅在需要时跑）；抖动加宽到 ±35% 且修复单侧钳位 bug；非校园网指数退避期间完全零外探 | `93-campus-auth` |
 | 上游 DNS 瘫痪韧性 | dnsmasq 并发查询上限 150→500、负缓存 10s；daemon 状态区分停机/非停机时段断网 | `98-campus-dhcp-fingerprint` `93-campus-auth` |
 | 栈指纹 | tcp_timestamps/window_scaling 保持开启、rp_filter 开 | `97-campus-wan-hygiene` |
 | IP-MAC 绑定 / 客户端数 | NAT 天然只暴露路由器单 MAC + 单认证会话 | 无需配置 |
@@ -89,7 +90,7 @@
 ## 使用方法
 
 1. **构建**：本仓库已配好 Actions。进 **Actions → Build RM AC2100 OpenWrt
-   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.8.1）直接 Run，
+   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.9.0）直接 Run，
    约 3-5 分钟出包。可调输入：
    - `openwrt_version`：OpenWrt 底包版本
    - `include_luci`：是否带 LuCI（false = 纯 CLI，省内存）
@@ -121,12 +122,14 @@
 ## 首次进系统检查清单
 
 ```
-cat /etc/campus-fix-version        # 应显示 2.8.1
+cat /etc/campus-fix-version        # 应显示 2.9.0
 nft list chain inet fw4 campus_ttl_postrouting     # counter 在涨 = TTL 归一生效
 nft list chain inet fw4 campus_quic_block          # drop 在涨 = 有客户端试图 QUIC
 nft list chain inet fw4 campus_leak_block          # 发现协议封锁生效
 logread -e campus-fw4guard                         # 应有 dry-run OK（无输出=无 drop-in 或未跑）
 nft list chain inet fw4 campus_mss_clamp           # counter 在涨 = MSS 归一生效
+nft list chain inet fw4 campus_synrate             # counter 在涨 = 聚合 SYN 限速在丢突发
+cat /tmp/campus-auth.banuntil 2>/dev/null          # 存在且未过期 = 代理行为封禁静默期
 uci -q get network.wan.macaddr     # 自定义 WAN MAC（若通过 LuCI 设置过；出厂 MAC 时为空）
 ```
 
@@ -156,12 +159,12 @@ uci -q get network.wan.macaddr     # 自定义 WAN MAC（若通过 LuCI 设置�
 
 | 症状 | 处理 |
 |---|---|
-| TTL 改过仍被踢 | v2.7 已覆盖 TTL/IP-ID/DSCP/QUIC/DNS/DHCP/MAC/MSS/流数/速率；再被踢说明检测在 TLS 指纹（JA3）或 UA 层，需终端侧配合（浏览器扩展统一 UA） |
+| TTL 改过仍被踢 | v2.9 已覆盖 TTL/IP-ID/DSCP/QUIC/DNS/DHCP/MAC/MSS/聚合SYN速率/探测签名/封禁持久化静默；再被踢说明检测在 TLS 指纹（JA3）或 UA 层，需终端侧配合（浏览器扩展统一 UA） |
 | 日志刷 "Maximum number of concurrent DNS queries reached" | 上游 DNS 瘫痪时 LAN 客户端重试堆积。v2.7.2 已调 dnsforwardmax=500 + 负缓存 10s 缓解；若仍频繁出现，检查上游 DNS 是否长期不可用（换 223.5.5.5 等公共 DNS 做转发）
 | 手动下线报「下线失败（code=1）」 | v2.7.4 已修：下线请求 portaltype 对齐官方 logout 页的空串（原硬编码 0 被 AC 拒绝）；LuCI 通知现在同时显示服务端 message |
 | 勾选自动认证后不认证、日志报 HTTP dead | v2.7.0-2.7.2 的致命 bug：uclient-fetch **没有** --header 选项，v2.7.0 加上的 --header 让所有请求静默失败（usage 错误被 2>/dev/null 吞掉）→ 探测不到劫持页 → 永远不会走认证路径。v2.7.3 已移除全部 --header 用法 |
 | daemon 报 "HTTP dead, ICMP alive" 但不是停机时段 | v2.7.2 起状态与日志区分「停机时段」与「非停机时段（疑似上游 DNS 故障）」；同时修复移动 WiFi 上级路由占用 10.0.0.1 导致退避永不生效的漏洞（现仅劫持跳转/真实可达才复位退避） |
-| 触发「代理行为」封禁 | v2.7.1 已含守护进程抖动退避 + 请求头补齐（MSS/速率规则因 v2.7.0 事故撤回）；若再次触发，先确认终端是否开着代理/VPN 客户端 |
+| 触发「代理行为」封禁 | v2.9.0 起封禁期完全静默且**跨重启持久化**（`/tmp/campus-auth.banuntil`），到期自动恢复；期间 LuCI「立即认证」也会拒绝并提示到期时间——**请勿反复手动尝试**（同 MAC 重复认证会加重标记）。封禁结束后若仍频繁触发：先看 `nft list chain inet fw4 campus_synrate` drop 计数（聚合速率是否常态超限），再确认终端是否开着代理/VPN 客户端 |
 | 刷后 LAN 不通 / 拿不到 IP | `logread -e campus-fw4guard` —— v2.7.1 起规则集加载失败会自动隔离 `/etc/nftables.d/` 下全部 drop-in 并按原厂防火墙起网（日志可见），LAN 永不再因规则挂掉 |
 | 改 MAC 后无法上网 | 认证会话绑旧 MAC——认证页重新登录 |
 | 「校园网 MAC」页点「生成」报 MAC 生成失败（Network 面板看 rpcd 应答正常） | v2.8.1 已修：前端 rpc.declare 的 `expect:{'mac':''}` 把应答解包成裸字符串，`ret.mac` 为 undefined 走了失败分支（livemac 同因致「实际 MAC」恒显未知）。改 `expect:{}` 取完整对象 |
@@ -177,7 +180,8 @@ files/
 │   ├── 10-campus-ttl-fix.nft        # TTL / IP-ID / DSCP / QUIC（核心）
 │   ├── 15-campus-dns-fix.nft        # LAN DNS 强制重定向
 │   ├── 20-campus-egress-hygiene.nft # DoT/发现协议/ICMP-ts 封锁 + NTP 重定向 + 可选开关
-│   └── 25-campus-mss.nft           # MSS clamp（v2.8.0 灰度回归，fw4guard 兜底）
+│   ├── 25-campus-mss.nft           # MSS clamp（v2.8.0 灰度回归，fw4guard 兜底）
+│   └── 30-campus-synrate.nft       # 聚合 LAN SYN 速率上限（v2.9.0 单条灰度，stateless limit）
 └── etc/uci-defaults/
     ├── 89-campus-fw4guard           # fw4 规则集自检：加载失败自动隔离 drop-in（保 LAN 永不死）
     ├── 95-campus-mac-luci           # LuCI「Campus MAC」页面
@@ -220,3 +224,4 @@ files/
 | v2.7.6 | 用户实测补全三态矩阵：**停机时 3.3.3.3 也会应答**——返回「该时间段不在可用区间」类拒绝文案（非劫持跳转）。v2.7.5 会把这种情况误报为 probe-failed（网关应答但无劫持跳转）。修复：probe_params 捕获 AC 拒绝页关键词（不在可用/可用区间/时间段/暂停/停机/维护，UTF-8 字节级 grep）到 PROBE_NOTE；主循环无劫持分支优先识别为 maintenance 状态（校园网在但夜间关闭，静默等待到点自动恢复认证）而非 probe-failed；off-campus 计分同步——命中拒绝文案=确凿在校园网（除校园网外无人会应答这种文本），退避计数复位永不误退避 |
 | v2.8.0 | 三项功能：①「校园网 MAC」页 MAC 生成失败修复——rotate 的 popen 未做 null 防护（popen 失败即整个 rpcd 方法抛异常→LuCI 永远显示「MAC 生成失败」），且 hexdump -e 格式在部分环境产出为空；改为 /proc/sys/kernel/random/uuid 为主随机源（procfs 纯读取零依赖，去 - 后取 12 hex），hexdump 兜底，popen 全防护②MSS clamp 灰度回归（`25-campus-mss.nft`，单文件单链）——v2.7.0 三条规则齐上导致 LAN 全死后回滚，现按「一次一条+守卫兜底」策略重启：MSS clamp 与 fw4 官方 mtu_fix 输出同款内核表达式，fw4guard（S18）boot 干跑失败自动隔离 drop-in，最坏情况=该特性静默失效而非断网③代理行为封禁识别——quickauth 应答 message 命中「禁用/禁止/代理行为/封禁」关键词即解析「N分钟」（无数字默认 30），进入 banned 状态：显示到期时刻、静默等待（封禁期间同 MAC 重复认证会加重标记）、每 5 分钟分片睡眠保持 uci 可即时停用；LuCI 认证页状态显示全面增强（状态前缀→中文标签+颜色：在线绿/封禁红/其他蓝，原始状态串小字展示，封禁时红字警示勿手动重试） |
 | v2.8.1 | 「MAC 生成失败」真正根因修复：v2.8.0 修的是后端随机源（popen 防护/uuid 主源），但用户实测 Network 面板显示 rpcd 应答完全正常（`[0,{"mac":"02eeef99817f"}]`）仍报失败——问题在前端。rpc.js 的 `expect:{'mac':''}` 会把应答**解包**成裸字符串（handleCallReply 里 `ret=ret[key]`），前端 `ret.mac` 取值 undefined→永远走失败分支（livemac 同链路，「WAN 口当前实际 MAC」也因此恒显未知）。改 `expect:{}` 保留完整对象（campusauth 页 2026-09-17 起就是这么写的，MAC 页漏改）；失败通知附带后端 error 原因。教训：rpc.declare 的 expect 每个 key 都是一次解包+类型校验，取对象字段必须空 expect 拿整包 |
+| v2.9.0 | 反「代理行为」检测第二波（v2.8.x 仍触发封禁、普通浏览场景、保守灰度策略）：①新增 `30-campus-synrate.nft` 单条灰度——LAN 聚合 SYN 速率上限 40/s（burst 100），多设备突发叠加是 NAT 后最主要的速率类签名；刻意用 stateless `limit`（全桥单令牌桶=校方看到的聚合形态，per-host meter 管不住聚合）而非 meter/ct-count-in-set（v2.7.0 内核兼容事故教训），超限丢包 TCP 1s 重传，最坏=轻微延迟永不断连②daemon 稳态快速路径——已在线时每周期只 ping qq.com 一次即过（此前每轮 2 次劫持探测 HTTP + 1 次重复 check_online，全是非人类流量签名）；劫持探测只在掉线/首认时跑③check_online 单周期缓存（PRECHECK_RAN/PRECHECK_RC）消除同轮重复探测④封禁截止时间持久化到 /tmp/campus-auth.banuntil：AC 封禁是 MAC 级且比 daemon 活得久，v2.8.0 的 BAN_UNTIL 只在内存——procd respawn/重启即撞回封禁期继续 quickauth 加重标记；现在启动即恢复、到期自动清档，主循环顶端零探测静默门 + rpcd「立即认证」按钮封禁期直接拒绝（ucode 无 time() 内建，走 popen date；int('')=null 参与比较恒真的陷阱已防护）⑤抖动 ±20%→±35% 并修复单侧钳位 bug（v2.7.0 起 `[ $s -lt 0 ] && s=0` 把负半轴砍掉，抖动只剩 +0~+20%、基准 90s 仍可预测；混合源补 date +%M）⑥LuCI 新增 ban-expired 状态标签 |
