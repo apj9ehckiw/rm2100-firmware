@@ -3,11 +3,42 @@
 # Paired with the campus_ntp_redirect chain in 20-campus-egress-hygiene.nft:
 # LAN clients get redirected to this server, so no device sends its own
 # NTP fingerprint upstream.
+#
+# v2.9.1: + Asia/Shanghai default timezone and domestic NTP servers.
+# First boot with stock defaults showed a 15-month-old clock (UTC zone +
+# pool.ntp.org unreachable right after WAN came up) - wrong wall clock
+# breaks the auth daemon's active-window/weekday gates and the persisted
+# ban expiry math (epoch comparisons), so both must be right out of box.
 
 uci -q set system.ntp.enable='1'
 uci -q set system.ntp.enable_server='1'
 # sysntpd validates 'interface' as a plain string option, not a list
 uci -q set system.ntp.interface='lan'
+# Domestic NTP servers first: openwrt.pool.ntp.org needs DNS + a working
+# international route at the exact moment WAN comes up - on campus lines
+# (pre-auth DNS dead) that routinely fails and the clock stays on RTC.
+# AliDNS/Tencent/Apple-CN all answer from inside China over UDP/123.
+uci -q delete system.ntp.server
+uci -q add_list system.ntp.server='ntp.aliyun.com'
+uci -q add_list system.ntp.server='ntp1.aliyun.com'
+uci -q add_list system.ntp.server='ntp.tencent.com'
+uci -q add_list system.ntp.server='time.apple.com'
+
+# --- timezone: Asia/Shanghai (UTC+8, no DST) ------------------------------
+# OpenWrt images ship UTC by default. zoneinfo/tzdata is NOT installed
+# (16MB flash budget), so set both fields the way LuCI does for a manual
+# zone pick: zonename is what the LuCI dropdown re-selects, timezone is
+# what actually lands in /etc/TZ (posix TZ string, CST-8 = UTC+8).
+uci -q set system.@system[0].zonename='Asia/Shanghai'
+uci -q set system.@system[0].timezone='CST-8'
+
 uci -q commit system
+
+# apply immediately on first boot (uci-defaults runs at S10, before the
+# services that would otherwise read the stale config): rewrite /etc/TZ
+# (libc reads it per-call, no restart needed) and nudge sysntpd if it is
+# already up to re-sync with the new server list.
+echo 'CST-8' > /etc/TZ
+[ -x /etc/init.d/sysntpd ] && /etc/init.d/sysntpd started && /etc/init.d/sysntpd restart
 
 exit 0

@@ -26,6 +26,15 @@
 # firewall + NAT - internet works, LuCI works, only the campus anti-
 # detection extras are off. The failure is visible in the log instead of
 # being a dead LAN.
+#
+# v2.9.1: the init script is armed too late for FIRST boot. uci-defaults
+# runs at S10; an enable at S10 creates the S18 rc.d symlink AFTER this
+# boot's start sequence was already expanded, so the guard only ever ran
+# from the SECOND boot on - leaving the riskiest boot (first flash, exactly
+# when v2.7.0 died) unguarded. Fix: run the same dry-run check INLINE here
+# at S10, before fw4's S19 loads the ruleset. Quarantine-at-S10 wins the
+# race cleanly: fw4 then starts with either the validated drop-ins or the
+# stock ruleset.
 
 mkdir -p /etc/init.d
 cat > /etc/init.d/campus-fw4guard <<'GUARDEOF'
@@ -61,5 +70,20 @@ chmod +x /etc/init.d/campus-fw4guard
 
 # fw4's own init is START=19 (S19firewall). Our guard must run first.
 /etc/init.d/campus-fw4guard enable
+
+# v2.9.1: also run the check ONCE right here (S10, first boot). enable at
+# S10 arms S18 only for FUTURE boots; the first boot's fw4 (S19) would
+# otherwise load the drop-ins completely unguarded. `fw4 print` works with
+# fw4 not yet started (it renders config, it does not query the running
+# ruleset), so the same dry-run logic applies verbatim.
+if ls /etc/nftables.d/*.nft >/dev/null 2>&1; then
+	if fw4 print 2>/dev/null | nft -c -f - >/dev/null 2>&1; then
+		logger -t campus-fw4guard "first-boot inline dry-run OK (uci-defaults S10)"
+	else
+		logger -t campus-fw4guard "first-boot inline dry-run FAILED; quarantining drop-ins before fw4 starts"
+		mkdir -p /etc/nftables.d.disabled
+		mv /etc/nftables.d/*.nft /etc/nftables.d.disabled/ 2>/dev/null
+	fi
+fi
 
 exit 0

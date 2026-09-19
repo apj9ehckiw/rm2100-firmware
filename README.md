@@ -3,7 +3,7 @@
 红米 RM AC2100（MediaTek MT7621A，128MB RAM / 16MB flash）专用 OpenWrt 固件，
 内置**校园网多设备检测规避**套件，通过 GitHub Actions 云端构建，本机无需 Linux 环境。
 
-**当前固件版本：v2.9.0**（刷入后 `cat /etc/campus-fix-version` 查询；LuCI 页脚也显示 `campus-fix vX.Y.Z`）
+**当前固件版本：v2.9.1**（刷入后 `cat /etc/campus-fix-version` 查询；LuCI 页脚也显示 `campus-fix vX.Y.Z`）
 
 ## 功能总览
 
@@ -90,7 +90,7 @@
 ## 使用方法
 
 1. **构建**：本仓库已配好 Actions。进 **Actions → Build RM AC2100 OpenWrt
-   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.9.0）直接 Run，
+   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.9.1）直接 Run，
    约 3-5 分钟出包。可调输入：
    - `openwrt_version`：OpenWrt 底包版本
    - `include_luci`：是否带 LuCI（false = 纯 CLI，省内存）
@@ -122,7 +122,7 @@
 ## 首次进系统检查清单
 
 ```
-cat /etc/campus-fix-version        # 应显示 2.9.0
+cat /etc/campus-fix-version        # 应显示 2.9.1
 nft list chain inet fw4 campus_ttl_postrouting     # counter 在涨 = TTL 归一生效
 nft list chain inet fw4 campus_quic_block          # drop 在涨 = 有客户端试图 QUIC
 nft list chain inet fw4 campus_leak_block          # 发现协议封锁生效
@@ -225,3 +225,4 @@ files/
 | v2.8.0 | 三项功能：①「校园网 MAC」页 MAC 生成失败修复——rotate 的 popen 未做 null 防护（popen 失败即整个 rpcd 方法抛异常→LuCI 永远显示「MAC 生成失败」），且 hexdump -e 格式在部分环境产出为空；改为 /proc/sys/kernel/random/uuid 为主随机源（procfs 纯读取零依赖，去 - 后取 12 hex），hexdump 兜底，popen 全防护②MSS clamp 灰度回归（`25-campus-mss.nft`，单文件单链）——v2.7.0 三条规则齐上导致 LAN 全死后回滚，现按「一次一条+守卫兜底」策略重启：MSS clamp 与 fw4 官方 mtu_fix 输出同款内核表达式，fw4guard（S18）boot 干跑失败自动隔离 drop-in，最坏情况=该特性静默失效而非断网③代理行为封禁识别——quickauth 应答 message 命中「禁用/禁止/代理行为/封禁」关键词即解析「N分钟」（无数字默认 30），进入 banned 状态：显示到期时刻、静默等待（封禁期间同 MAC 重复认证会加重标记）、每 5 分钟分片睡眠保持 uci 可即时停用；LuCI 认证页状态显示全面增强（状态前缀→中文标签+颜色：在线绿/封禁红/其他蓝，原始状态串小字展示，封禁时红字警示勿手动重试） |
 | v2.8.1 | 「MAC 生成失败」真正根因修复：v2.8.0 修的是后端随机源（popen 防护/uuid 主源），但用户实测 Network 面板显示 rpcd 应答完全正常（`[0,{"mac":"02eeef99817f"}]`）仍报失败——问题在前端。rpc.js 的 `expect:{'mac':''}` 会把应答**解包**成裸字符串（handleCallReply 里 `ret=ret[key]`），前端 `ret.mac` 取值 undefined→永远走失败分支（livemac 同链路，「WAN 口当前实际 MAC」也因此恒显未知）。改 `expect:{}` 保留完整对象（campusauth 页 2026-09-17 起就是这么写的，MAC 页漏改）；失败通知附带后端 error 原因。教训：rpc.declare 的 expect 每个 key 都是一次解包+类型校验，取对象字段必须空 expect 拿整包 |
 | v2.9.0 | 反「代理行为」检测第二波（v2.8.x 仍触发封禁、普通浏览场景、保守灰度策略）：①新增 `30-campus-synrate.nft` 单条灰度——LAN 聚合 SYN 速率上限 40/s（burst 100），多设备突发叠加是 NAT 后最主要的速率类签名；刻意用 stateless `limit`（全桥单令牌桶=校方看到的聚合形态，per-host meter 管不住聚合）而非 meter/ct-count-in-set（v2.7.0 内核兼容事故教训），超限丢包 TCP 1s 重传，最坏=轻微延迟永不断连②daemon 稳态快速路径——已在线时每周期只 ping qq.com 一次即过（此前每轮 2 次劫持探测 HTTP + 1 次重复 check_online，全是非人类流量签名）；劫持探测只在掉线/首认时跑③check_online 单周期缓存（PRECHECK_RAN/PRECHECK_RC）消除同轮重复探测④封禁截止时间持久化到 /tmp/campus-auth.banuntil：AC 封禁是 MAC 级且比 daemon 活得久，v2.8.0 的 BAN_UNTIL 只在内存——procd respawn/重启即撞回封禁期继续 quickauth 加重标记；现在启动即恢复、到期自动清档，主循环顶端零探测静默门 + rpcd「立即认证」按钮封禁期直接拒绝（ucode 无 time() 内建，走 popen date；int('')=null 参与比较恒真的陷阱已防护）⑤抖动 ±20%→±35% 并修复单侧钳位 bug（v2.7.0 起 `[ $s -lt 0 ] && s=0` 把负半轴砍掉，抖动只剩 +0~+20%、基准 90s 仍可预测；混合源补 date +%M）⑥LuCI 新增 ban-expired 状态标签 |
+| v2.9.1 | 两项首刷体验修复（v2.9.0 实测反馈）：①默认时区 UTC→Asia/Shanghai（CST-8，写 zonename+timezone 双字段对齐 LuCI 手动选时区的落盘方式；镜像无 tzdata 故用 posix TZ 串），并首刷当场生效（重写 /etc/TZ + 重启 sysntpd）；NTP 服务器改国内源（ntp.aliyun.com/ntp1.aliyun.com/ntp.tencent.com/time.apple.com）——openwrt.pool.ntp.org 在校园线刚上线时刻（DNS 未通）常同步失败，导致时钟停在 RTC 旧值（实测首刷后慢了 15 个月），错误墙钟会让运行时段/星期闸门与封禁到期 epoch 计算全部失真②fw4guard 首刷缺口：uci-defaults（S10）里 enable 创建的 S18 软链赶不上本次开机的启动序列——守卫实际从第二次开机才在岗，最危险的首刷那次 fw4 裸加载 drop-in 无人看守（v2.7.0 正是首刷炸的）；现在同款干跑校验内联进 S10 当场执行（fw4 print 不依赖 fw4 已启动），失败当场隔离，S19 的 fw4 拿到的要么是已验证规则集要么是原厂规则集 |
