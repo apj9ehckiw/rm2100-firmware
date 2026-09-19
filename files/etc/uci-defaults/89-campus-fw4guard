@@ -35,6 +35,18 @@
 # at S10, before fw4's S19 loads the ruleset. Quarantine-at-S10 wins the
 # race cleanly: fw4 then starts with either the validated drop-ins or the
 # stock ruleset.
+#
+# v2.9.2: THE S18 GUARD NEVER RAN AT ALL. The generated init script defined
+# only start_service() with no USE_PROCD=1, and /etc/rc.common ships a
+# default `start() { return 0 }` (line 11) that is only OVERRIDDEN inside
+# the `[ -n "$USE_PROCD" ] && {...}` block (line 121). So `S18campus-fw4guard
+# boot` -> boot() -> start() -> return 0: start_service() was dead code on
+# every boot. Combined with /etc/init.d/boot's `( . "$file" ) && rm -f
+# "$file"` deleting this uci-defaults script after first boot, the ONLY
+# working protection was the v2.9.1 inline check - i.e. the safety net
+# existed for exactly one boot ever. Fix: define start() directly (the
+# idiom every non-procd OpenWrt init uses - sysfixtime/sysctl/led/umount),
+# which also sidesteps procd's empty-instance path entirely.
 
 mkdir -p /etc/init.d
 cat > /etc/init.d/campus-fw4guard <<'GUARDEOF'
@@ -46,16 +58,22 @@ cat > /etc/init.d/campus-fw4guard <<'GUARDEOF'
 # the stock ruleset so the LAN always comes up.
 START=18
 
-start_service() {
+# NOT USE_PROCD: this is a one-shot boot task with no supervised instance.
+# It must be `start()` - rc.common's default `start() { return 0 }` is only
+# replaced when USE_PROCD=1 is set, so a bare start_service() here would be
+# silently skipped (that was the v2.7.1~v2.9.1 bug: the guard never ran).
+start() {
 	# no drop-ins -> nothing to guard
 	ls /etc/nftables.d/*.nft >/dev/null 2>&1 || return 0
 
-	# Dry-run the full ruleset fw4 would load. fw4 print emits the
-	# complete nft file (including the nftables.d includes); feed it to
-	# `nft -c -f -` for a syntax+semantic check without touching the
-	# running ruleset. -c still consults the kernel for some
-	# expressions, which is exactly what we want (the v2.7.0 failure
-	# mode was userspace-OK-kernel-NO).
+	# Dry-run the full ruleset fw4 would load. `fw4 print` emits the
+	# complete nft file (including the /etc/nftables.d/*.nft drop-ins);
+	# feed it to `nft -c -f -` for a syntax+semantic check without touching
+	# the running ruleset. -c still consults the kernel for some
+	# expressions, which is exactly what we want (the v2.7.0 failure mode
+	# was userspace-OK-kernel-NO, which plain `nft -c` in CI could not see).
+	# Pipe exit status is nft's, and an EMPTY stdin is a valid (empty)
+	# ruleset - so a `fw4 print` failure can never cause a false quarantine.
 	if ! fw4 print 2>/dev/null | nft -c -f - >/dev/null 2>&1; then
 		logger -t campus-fw4guard "fw4 ruleset FAILED dry-run; quarantining /etc/nftables.d drop-ins"
 		mkdir -p /etc/nftables.d.disabled
@@ -64,6 +82,7 @@ start_service() {
 	else
 		logger -t campus-fw4guard "fw4 ruleset dry-run OK"
 	fi
+	return 0
 }
 GUARDEOF
 chmod +x /etc/init.d/campus-fw4guard
@@ -71,19 +90,19 @@ chmod +x /etc/init.d/campus-fw4guard
 # fw4's own init is START=19 (S19firewall). Our guard must run first.
 /etc/init.d/campus-fw4guard enable
 
-# v2.9.1: also run the check ONCE right here (S10, first boot). enable at
-# S10 arms S18 only for FUTURE boots; the first boot's fw4 (S19) would
-# otherwise load the drop-ins completely unguarded. `fw4 print` works with
-# fw4 not yet started (it renders config, it does not query the running
-# ruleset), so the same dry-run logic applies verbatim.
-if ls /etc/nftables.d/*.nft >/dev/null 2>&1; then
-	if fw4 print 2>/dev/null | nft -c -f - >/dev/null 2>&1; then
-		logger -t campus-fw4guard "first-boot inline dry-run OK (uci-defaults S10)"
-	else
-		logger -t campus-fw4guard "first-boot inline dry-run FAILED; quarantining drop-ins before fw4 starts"
-		mkdir -p /etc/nftables.d.disabled
-		mv /etc/nftables.d/*.nft /etc/nftables.d.disabled/ 2>/dev/null
-	fi
-fi
+# v2.9.1: ALSO run the check right here (S10, first boot). `enable` at S10
+# creates the S18 rc.d symlink only for FUTURE boots - this boot's start
+# sequence was already expanded - so without this the first boot's fw4 (S19)
+# would load the drop-ins completely unguarded, and the first flash is
+# exactly when v2.7.0 died.
+#
+# v2.9.2: call the init script we just wrote instead of duplicating the
+# dry-run logic inline. Two copies of the same check is how the S18 path
+# silently rotted into dead code in the first place; now the first-boot
+# run and every later S18 run execute byte-identical code.
+# `fw4 print` does not need fw4 to be running (it renders config, it does
+# not query the live ruleset), and ubusd is up by S10, so this is safe here.
+/etc/init.d/campus-fw4guard start
+logger -t campus-fw4guard "first-boot inline guard done (uci-defaults S10)"
 
 exit 0

@@ -38,7 +38,19 @@ uci -q commit system
 # services that would otherwise read the stale config): rewrite /etc/TZ
 # (libc reads it per-call, no restart needed) and nudge sysntpd if it is
 # already up to re-sync with the new server list.
+#
+# v2.9.2: `started` is NOT a valid rc.common action. ALL_COMMANDS only holds
+# boot/shutdown/depends/start/stop/restart/reload/enable/disable/enabled
+# (+running/status/trace/info when USE_PROCD=1), and rc.common ends with
+# `list_contains ALL_COMMANDS "$action" || action=help` - so `started` fell
+# through to help(), which prints the usage text and returns 0. The `&&`
+# guard was therefore always TRUE: sysntpd got restarted unconditionally and
+# the usage dump polluted the uci-defaults output. sysntpd sets USE_PROCD=1,
+# so the right probe is `running` (rc.common -> service_running ->
+# procd_running).
 echo 'CST-8' > /etc/TZ
-[ -x /etc/init.d/sysntpd ] && /etc/init.d/sysntpd started && /etc/init.d/sysntpd restart
+if [ -x /etc/init.d/sysntpd ] && /etc/init.d/sysntpd running >/dev/null 2>&1; then
+	/etc/init.d/sysntpd restart
+fi
 
 exit 0

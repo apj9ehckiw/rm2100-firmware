@@ -3,7 +3,7 @@
 红米 RM AC2100（MediaTek MT7621A，128MB RAM / 16MB flash）专用 OpenWrt 固件，
 内置**校园网多设备检测规避**套件，通过 GitHub Actions 云端构建，本机无需 Linux 环境。
 
-**当前固件版本：v2.9.1**（刷入后 `cat /etc/campus-fix-version` 查询；LuCI 页脚也显示 `campus-fix vX.Y.Z`）
+**当前固件版本：v2.9.2**（刷入后 `cat /etc/campus-fix-version` 查询；LuCI 页脚也显示 `campus-fix vX.Y.Z`）
 
 ## 功能总览
 
@@ -90,7 +90,7 @@
 ## 使用方法
 
 1. **构建**：本仓库已配好 Actions。进 **Actions → Build RM AC2100 OpenWrt
-   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.9.1）直接 Run，
+   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.9.2）直接 Run，
    约 3-5 分钟出包。可调输入：
    - `openwrt_version`：OpenWrt 底包版本
    - `include_luci`：是否带 LuCI（false = 纯 CLI，省内存）
@@ -122,7 +122,7 @@
 ## 首次进系统检查清单
 
 ```
-cat /etc/campus-fix-version        # 应显示 2.9.1
+cat /etc/campus-fix-version        # 应显示 2.9.2
 nft list chain inet fw4 campus_ttl_postrouting     # counter 在涨 = TTL 归一生效
 nft list chain inet fw4 campus_quic_block          # drop 在涨 = 有客户端试图 QUIC
 nft list chain inet fw4 campus_leak_block          # 发现协议封锁生效
@@ -226,3 +226,4 @@ files/
 | v2.8.1 | 「MAC 生成失败」真正根因修复：v2.8.0 修的是后端随机源（popen 防护/uuid 主源），但用户实测 Network 面板显示 rpcd 应答完全正常（`[0,{"mac":"02eeef99817f"}]`）仍报失败——问题在前端。rpc.js 的 `expect:{'mac':''}` 会把应答**解包**成裸字符串（handleCallReply 里 `ret=ret[key]`），前端 `ret.mac` 取值 undefined→永远走失败分支（livemac 同链路，「WAN 口当前实际 MAC」也因此恒显未知）。改 `expect:{}` 保留完整对象（campusauth 页 2026-09-17 起就是这么写的，MAC 页漏改）；失败通知附带后端 error 原因。教训：rpc.declare 的 expect 每个 key 都是一次解包+类型校验，取对象字段必须空 expect 拿整包 |
 | v2.9.0 | 反「代理行为」检测第二波（v2.8.x 仍触发封禁、普通浏览场景、保守灰度策略）：①新增 `30-campus-synrate.nft` 单条灰度——LAN 聚合 SYN 速率上限 40/s（burst 100），多设备突发叠加是 NAT 后最主要的速率类签名；刻意用 stateless `limit`（全桥单令牌桶=校方看到的聚合形态，per-host meter 管不住聚合）而非 meter/ct-count-in-set（v2.7.0 内核兼容事故教训），超限丢包 TCP 1s 重传，最坏=轻微延迟永不断连②daemon 稳态快速路径——已在线时每周期只 ping qq.com 一次即过（此前每轮 2 次劫持探测 HTTP + 1 次重复 check_online，全是非人类流量签名）；劫持探测只在掉线/首认时跑③check_online 单周期缓存（PRECHECK_RAN/PRECHECK_RC）消除同轮重复探测④封禁截止时间持久化到 /tmp/campus-auth.banuntil：AC 封禁是 MAC 级且比 daemon 活得久，v2.8.0 的 BAN_UNTIL 只在内存——procd respawn/重启即撞回封禁期继续 quickauth 加重标记；现在启动即恢复、到期自动清档，主循环顶端零探测静默门 + rpcd「立即认证」按钮封禁期直接拒绝（ucode 无 time() 内建，走 popen date；int('')=null 参与比较恒真的陷阱已防护）⑤抖动 ±20%→±35% 并修复单侧钳位 bug（v2.7.0 起 `[ $s -lt 0 ] && s=0` 把负半轴砍掉，抖动只剩 +0~+20%、基准 90s 仍可预测；混合源补 date +%M）⑥LuCI 新增 ban-expired 状态标签 |
 | v2.9.1 | 两项首刷体验修复（v2.9.0 实测反馈）：①默认时区 UTC→Asia/Shanghai（CST-8，写 zonename+timezone 双字段对齐 LuCI 手动选时区的落盘方式；镜像无 tzdata 故用 posix TZ 串），并首刷当场生效（重写 /etc/TZ + 重启 sysntpd）；NTP 服务器改国内源（ntp.aliyun.com/ntp1.aliyun.com/ntp.tencent.com/time.apple.com）——openwrt.pool.ntp.org 在校园线刚上线时刻（DNS 未通）常同步失败，导致时钟停在 RTC 旧值（实测首刷后慢了 15 个月），错误墙钟会让运行时段/星期闸门与封禁到期 epoch 计算全部失真②fw4guard 首刷缺口：uci-defaults（S10）里 enable 创建的 S18 软链赶不上本次开机的启动序列——守卫实际从第二次开机才在岗，最危险的首刷那次 fw4 裸加载 drop-in 无人看守（v2.7.0 正是首刷炸的）；现在同款干跑校验内联进 S10 当场执行（fw4 print 不依赖 fw4 已启动），失败当场隔离，S19 的 fw4 拿到的要么是已验证规则集要么是原厂规则集 |
+| v2.9.2 | 代码审查修复波（纯缺陷/安全，不动网络面规则）：①**fw4guard 的 S18 守卫从未执行过**——生成的 init 只定义了 `start_service()` 却没 `USE_PROCD=1`，而 rc.common 第 11 行自带默认 `start() { return 0 }`、只在 `[ -n "$USE_PROCD" ]` 块（第 121 行）里才被覆盖 → `S18campus-fw4guard boot` 全程空转；叠加 `/etc/init.d/boot` 的 `( . "$file" ) && rm -f "$file"` 会在首刷后删掉 uci-defaults，v2.9.1 的内联检查也只跑一次——整套 v2.7.0 事故建立的安全网实际上只存在过一次开机（已用实机 rootfs 的 rc.common 搭测试台复现：旧版 fw4/nft/logger 调用次数 0，新版 3 次且失败时正确隔离）；改为直接定义 `start()`（sysfixtime/sysctl/led 同款非-procd 惯例），并让首刷内联检查直接 `campus-fw4guard start` 调用同一份代码——两份重复逻辑正是 S18 那份默默烂掉的原因②**rpcd ucode root 命令注入**：`login`/`logout` 用字符串拼接造 `popen` 命令行，而 `enc()` 不编码 `'`、portal 返回的 `wlanuserip/wlanacname/mac/vlan/serverip` 完全未编码、`logout` 里 `userid` 裸拼，`jget()` 的 `[^"]*` 又允许单引号——portal 是明文 HTTP，宿舍 ARP 欺骗/恶意上游即可控制这些字节，管理员点一次「立即认证」就在 rpcd 里以 root 执行任意命令（负向对照已实测：修复前 `/tmp/PWNED_root_shell` 被创建，修复后整个 URL 成为单个 argv）；新增 `shq()`（与 stock `usr/share/rpcd/ucode/luci` 的 `shellquote` 同形），所有插值统一过 `shq`/`enc`，`popen` 收敛到 `run()` 做 null 防护（旧 `exec.read()` 未防护，与 v2.8.0 修 rotate 同类）③**LuCI 存储型 XSS**：状态串里嵌的 portal `message/wlanuserip/wlanacname` 与 notification 里的 `code/message` 未转义就进了 `innerHTML`（已核实：luci.js `DOM.append` 对**单个字符串** children 走 `node.innerHTML`、数组才走 `createTextNode`；ui.js `addNotification` 把 children 不包数组直接传给 `dom.append`）；新增 `esc()` 在全部 sink 转义（`stat.label` 也需要：raw 不以 `[a-z-]` 开头时正则失配，head 会退化成整个 raw）④**`json_get` 贪婪冒号导致封禁检测可能失效**：`s/.*://` 吃到最后一个冒号，AC 文案如「代理行为检测:请联系网络中心」会被截成「请联系网络中心」→ 关键词丢失 → `BAN_SECONDS=0` → 守护进程在整个封禁期继续打 quickauth、每轮重新标记 MAC（正是封禁逻辑要防的）；改为锚定第一个冒号 + 只剥尾部分隔符（附带修好值内逗号被 `s/[\",}]//g` 删光）⑤**sysctl 全部不持久化**：uci-defaults 首刷后自删，`sysctl -qw` 只作用于当次运行、重启即回退；而且 4 条里 3 条本就是内核/`10-default.conf` 默认值（已比对实机：icmp_echo_ignore_broadcasts、tcp_timestamps 在 stock conf 里）；改写 `/etc/sysctl.d/99-campus.conf`（S11sysctl 每次开机加载，99- 排在 stock 10-/11- 之后故能覆盖），唯一真正偏离 stock 的 `rp_filter` 从 1（strict）降为 2（loose）——Linux 取 `max(all, <iface>)`，all=1 会把严格模式强加到包括 WAN 的每个接口，而非对称路由/PPPoE 拨号/会话中途默认路由翻转正是它要丢包的场景⑥**INTERVAL 未校验导致忙等死循环**：`uci get` 对「选项存在但值为空」输出空串且退出码 0，`\|\| echo 90` 兜底不触发 → disabled/paused 分支的裸 `sleep "$INTERVAL"` 变成 `sleep ""` 立即失败 → 单核 100% 空转；LuCI 的 range(30,3600) 挡不住 `uci set ... ''`；现在 `read_config` 统一校验并钳到 ≥30⑦**`/etc/init.d/sysntpd started` 不是合法 rc.common 动作**：ALL_COMMANDS 里没有 `started`，rc.common 末尾 `list_contains ... \|\| action=help` 把它变成打印用法并返回 0 → `&&` 恒真，restart 无条件执行且 help 文本污染 uci-defaults 输出；sysntpd 有 `USE_PROCD=1`，正确探活是 `running`⑧**`.gitattributes` 首行 `*. text eol=lf` 是笔误**：`*.` 匹配的是「以点结尾」的文件名（已验证：`git check-attr` 对 `foo.` 命中、对 `foo` 返回 unspecified），所有无扩展名的 uci-defaults 脚本和 `.nft` 都拿不到 eol 属性，在 Windows 上退回 `core.autocrlf=true` 被写成 CRLF（实测 93/98 已中招，仅因 git 归一化而在 `git status` 里看不出）——uci-defaults 是被 `. "$file"` sourced 的，行尾 `\r` 会并入 token（`mkdir -p /etc/init.d\r` 会建出带回车的目录），heredoc 产物也会带 CRLF 导致 `#!/bin/sh\r` bad interpreter；目前未出事只因为 CI 跑在 ubuntu；改为 `* text=auto eol=lf` + 按扩展名兜底 + 二进制显式标记，并把工作区规范回 LF⑨零碎：`jget()` 改 `-?[0-9]+`（旧正则匹配不到 `code=-1`，手动认证失败时 LuCI 显示 `code=null`）；`enc()`/`shq()`/MAC 的 `:` 改写全部改用 `/g` 正则（ucode 的 `replace()` 在 pattern 为字符串时只换第一个，所以旧代码把 MAC 编成了 `AA%3ABB:CC:DD:EE:FF`、密码含两个相同特殊字符时只编码一半）；`status` 里 pidfile 内容先验数字再插值；`is_active_day` 去掉 `${DAYS// /}` bashism（等价于 `[ -z "$DAYS" ]`，已逐取值验证） |
