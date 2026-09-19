@@ -134,9 +134,21 @@ return {
 				];
 				// 用 hex 尾部做 OUI 选择的熵源（避免再读一次随机）
 				let oui = OUIS[ hexdec(substr(hex, 10, 2)) % length(OUIS) ];
-				// 后 3 字节：取 hex 前 6 位，首字节清 LAA+组播位
+				// 首字节清 LAA(bit1)+组播(bit0) 位 → 全球单播
 				let b1 = hexdec(substr(oui, 0, 2)) & 0xFC;
-				return { mac: sprintf('%02x%s%s', b1, substr(oui, 2, 4), substr(hex, 0, 6)) };
+				// v2.10.1 修复：返回标准 xx:xx:xx:xx:xx:xx 冒号分隔格式。
+				// 旧版 sprintf('%02x%s%s', b1, oui[2:6], hex[0:6]) 拼出的是
+				// 12 位连续十六进制（如 "001b21a1b2c3"，无冒号），与页面
+				// 「6 组冒号分隔」的说明矛盾；填进 datatype='macaddr' 输入框、
+				// 写进 uci network.wan.macaddr 后，netifd/内核 sysfs 期望冒号
+				// 格式，无分隔串会导致自定义 MAC 静默不生效（一直是 WAN
+				// 出厂 MAC，rotate 形同虚设）。
+				// oui = 3 字节(前 3 组)，其中首字节已被 b1 覆盖清位；
+				// hex[0:6] = 后 3 字节(后 3 组)。共 6 组冒号分隔。
+				return { mac: sprintf('%02x:%s:%s:%s:%s:%s',
+					b1,
+					substr(oui, 2, 2), substr(oui, 4, 2),
+					substr(hex, 0, 2), substr(hex, 2, 2), substr(hex, 4, 2)) };
 			}
 		}
 	}
