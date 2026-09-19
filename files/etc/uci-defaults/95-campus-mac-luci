@@ -107,11 +107,36 @@ return {
 				if (length(hex) < 12)
 					return { mac: null, error: 'random source failed' };
 
-				// first byte: locally-administered unicast (bit1 set, bit0 clear)
+				// v2.10.0: 生成「真实 PC 网卡」形态的 MAC，不再生成本地管理地址。
+				// 旧版 (b1 | 0x02) 强制置 LAA 位（本地管理），而本校园 AC
+				// （PortalJsonAction 应答里的 randomMacTrace/macChange 字段、
+				// quickauth 的 Set-Cookie: macAuth=<mac> Max-Age=2年）明确在
+				// 追踪随机/变更 MAC——「换过几次 MAC 重试」正是 macChange 检测
+				// 的触发源，每次认证都重新标记。
+				// 改为：从一个常见 Windows 笔电/台机网卡厂商 OUI 里随机挑一个
+				// 作前 3 字节，后 3 字节随机；首字节清掉 LAA(bit1) 与组播(bit0)
+				// → 全球单播地址，看起来就是一台普通 PC。
 				// (ucode builtin is hexdec - hex2dec does not exist)
-				let b1 = (hexdec(substr(hex, 0, 2)) | 0x02) & 0xFE;
-
-				return { mac: sprintf('%02x%s', b1, substr(hex, 2, 10)) };
+				// 注意：全部选全球单播 OUI（首字节 bit1=0）。QEMU 的
+				// 52:54:00 本身是 LAA，不能用（清了 LAA 位就变成不存在
+				// 的厂商前缀 50:54:00）。
+				const OUIS = [
+					'001b21', // Intel
+					'0025d3', // Aztech / 常见板载
+					'00e04c', // Realtek
+					'a4b197', // 常见笔电
+					'005056', // VMware
+					'000c29', // VMware
+					'3cfdfe', // Intel
+					'f8bc12', // Dell
+					'00155d', // Microsoft Hyper-V
+					'b8ac6f'  // Dell
+				];
+				// 用 hex 尾部做 OUI 选择的熵源（避免再读一次随机）
+				let oui = OUIS[ hexdec(substr(hex, 10, 2)) % length(OUIS) ];
+				// 后 3 字节：取 hex 前 6 位，首字节清 LAA+组播位
+				let b1 = hexdec(substr(oui, 0, 2)) & 0xFC;
+				return { mac: sprintf('%02x%s%s', b1, substr(oui, 2, 4), substr(hex, 0, 6)) };
 			}
 		}
 	}
@@ -198,7 +223,8 @@ return view.extend({
 			_('<br /><br /><b>格式：</b>6 组冒号分隔的十六进制，如 <code>12:34:56:78:9A:BC</code>。') +
 			_('留空保存即可恢复出厂 WAN MAC。') +
 			_('<br /><br /><b>生效方式：</b><code>ifup wan</code> 或重启。') +
-			_('校园网认证通常与 MAC 绑定——修改后需在认证页重新登录。'));
+			_('校园网认证通常与 MAC 绑定——修改后需在认证页重新登录。') +
+			_('<br /><br /><b style="color:#e03131">警告：本校 AC 会追踪随机/变更 MAC（门户返回 randomMacTrace/macChange 字段，认证后种 macAuth 长效 cookie）。频繁更换 MAC——尤其是被封后立刻换 MAC 重试——会被判定为「代理行为」并加重标记。被封禁时请等待到期，不要换 MAC 绕过。建议：固定使用一个全球单播 MAC（克隆自己电脑的网卡 MAC 最自然），之后不要再变。</b>'));
 
 		s = m.section(form.NamedSection, 'wan', 'interface', _('WAN 接口'));
 

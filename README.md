@@ -3,14 +3,14 @@
 红米 RM AC2100（MediaTek MT7621A，128MB RAM / 16MB flash）专用 OpenWrt 固件，
 内置**校园网多设备检测规避**套件，通过 GitHub Actions 云端构建，本机无需 Linux 环境。
 
-**当前固件版本：v2.9.2**（刷入后 `cat /etc/campus-fix-version` 查询；LuCI 页脚也显示 `campus-fix vX.Y.Z`）
+**当前固件版本：v2.10.0**（刷入后 `cat /etc/campus-fix-version` 查询；LuCI 页脚也显示 `campus-fix vX.Y.Z`）
 
 ## 功能总览
 
 | 检测手段 | 对策 | 位置 / 操作 |
 |---|---|---|
 | TTL 检测 | WAN 出方向 IPv4 TTL / IPv6 hoplimit 强制 128（Windows 指纹；可改 64） | `10-campus-ttl-fix.nft` `campus_ttl_postrouting` |
-| IP-ID 熵检测 | 每 flow 稳定 IP-ID（五元组 hash），消除多 OS 混合指纹 | 同文件 `campus_ipid_postrouting` |
+| IP-ID 熵检测 | Windows 式全局递增 IP-ID（`numgen inc mod 65536`）：v2.10 起替换旧的 flow-hash——per-(src,dst) 恒定 ID 本身就是被动指纹（真实主机不会永远重复，中间盒才会），与 TTL=128 Windows 人设矛盾 | 同文件 `campus_ipid_postrouting` |
 | DSCP/QoS 相关性 | 出方向 DSCP 归一 CS0（ECN 保留） | 同文件 `campus_dscp_postrouting` |
 | QUIC/HTTP3 逃逸 | 转发层 DROP UDP/443，强制 TCP TLS | 同文件 `campus_quic_block` |
 | DNS 旁路 | LAN 全部 53 端口重定向到 dnsmasq（含硬编码 8.8.8.8 的设备） | `15-campus-dns-fix.nft` |
@@ -23,6 +23,8 @@
 | IPv6 泄漏 | LAN 默认关 RA/DHCPv6 | `99-campus-fix-banner` |
 | MSS 指纹混合 | WAN 出向 SYN 的 TCP MSS 统一 clamp 到路径 MTU（灰度回归，fw4guard 兜底） | `25-campus-mss.nft` `campus_mss_clamp` |
 | 聚合 SYN 速率 | LAN 全桥聚合新建连接速率上限 40/s（burst 100）：多设备突发叠加是「代理行为」判定的主要速率信号；stateless limit（非 meter/ct-count，避 v2.7.0 内核兼容雷） | `30-campus-synrate.nft` `campus_synrate` |
+| 认证客户端签名 | **v2.10 核心**：daemon/rpcd 的认证流量从「裸 quickauth」升级为完整浏览器会话形态——curl 带 ABMS cookie jar（portal.do 的 Set-Cookie 全程回传）、导航/XHR/CSS/JS 分模式 Accept 头集（HAR 逐条对齐 Chrome/152）、Referer 链（网关→portal.do→quickauth）、认证前加载页面+静态资产前奏、模拟输入间隔（三段 1~3s 抖动）；镜像内置 curl（uclient-fetch 无 --header/--cookie，永远补不齐这套头） | `93-campus-auth` `build.yml` |
+| 随机 MAC 追踪 | AC 有 randomMacTrace/macChange 字段+macAuth 长效 cookie，专项追踪本地管理地址（LAA）与 MAC 变更史。v2.10 起 rotate 生成真实厂商 OUI 全球单播 MAC（Intel/Realtek/Dell/VMware 池），LuCI 页面红字警告「被封后勿换 MAC 重试」 | `95-campus-mac-luci` |
 | 代理行为封禁识别 | quickauth 应答含「禁用/禁止/代理行为/封禁」即解析分钟数，banned 状态静默到期（重复尝试会加重标记）；封禁截止时间**持久化**——daemon 崩溃重启/路由器重启也不会撞回封禁期，LuCI「立即认证」按钮在封禁期直接拒绝 | `93-campus-auth` |
 | 探测行为签名 | 稳态在线时每周期只剩 1 次 ping qq.com（劫持探测/generate_204 仅在需要时跑）；抖动加宽到 ±35% 且修复单侧钳位 bug；非校园网指数退避期间完全零外探 | `93-campus-auth` |
 | 上游 DNS 瘫痪韧性 | dnsmasq 并发查询上限 150→500、负缓存 10s；daemon 状态区分停机/非停机时段断网 | `98-campus-dhcp-fingerprint` `93-campus-auth` |
@@ -122,7 +124,7 @@
 ## 首次进系统检查清单
 
 ```
-cat /etc/campus-fix-version        # 应显示 2.9.2
+cat /etc/campus-fix-version        # 应显示 2.10.0
 nft list chain inet fw4 campus_ttl_postrouting     # counter 在涨 = TTL 归一生效
 nft list chain inet fw4 campus_quic_block          # drop 在涨 = 有客户端试图 QUIC
 nft list chain inet fw4 campus_leak_block          # 发现协议封锁生效
@@ -141,7 +143,7 @@ uci -q get network.wan.macaddr     # 自定义 WAN MAC（若通过 LuCI 设置�
   `ip ttl 64-128` 匹配域不用动），`service firewall restart`
 - **改规则后重建固件**：改 `files/` 下对应文件，commit + push，重新 Run
   workflow（workflow 里 `PACKAGES` 追加了 `kmod-ipt-nat ip6tables-nft
-  iptables-nft`，兼容 iptables 老脚本习惯）
+  iptables-nft curl`，curl 为 v2.10 认证浏览器形态所需）
 - **某设备必须用指定 DNS**（如公司 VPN 客户端校验）：LuCI 防火墙给它加
   例外，或删 `/etc/nftables.d/15-campus-dns-fix.nft`
 - **要连校园网 SMB 文件共享**：删 `20-campus-egress-hygiene.nft` 里
@@ -159,12 +161,12 @@ uci -q get network.wan.macaddr     # 自定义 WAN MAC（若通过 LuCI 设置�
 
 | 症状 | 处理 |
 |---|---|
-| TTL 改过仍被踢 | v2.9 已覆盖 TTL/IP-ID/DSCP/QUIC/DNS/DHCP/MAC/MSS/聚合SYN速率/探测签名/封禁持久化静默；再被踢说明检测在 TLS 指纹（JA3）或 UA 层，需终端侧配合（浏览器扩展统一 UA） |
+| TTL 改过仍被踢 | v2.10 已覆盖 TTL/IP-ID/DSCP/QUIC/DNS/DHCP/MAC/MSS/聚合SYN速率/探测签名/封禁持久化静默/**认证客户端签名（浏览器会话形态）**/随机MAC追踪；再被踢说明检测在 TLS 指纹（JA3/JA4）层，需终端侧配合（浏览器扩展统一 UA） |
 | 日志刷 "Maximum number of concurrent DNS queries reached" | 上游 DNS 瘫痪时 LAN 客户端重试堆积。v2.7.2 已调 dnsforwardmax=500 + 负缓存 10s 缓解；若仍频繁出现，检查上游 DNS 是否长期不可用（换 223.5.5.5 等公共 DNS 做转发）
 | 手动下线报「下线失败（code=1）」 | v2.7.4 已修：下线请求 portaltype 对齐官方 logout 页的空串（原硬编码 0 被 AC 拒绝）；LuCI 通知现在同时显示服务端 message |
 | 勾选自动认证后不认证、日志报 HTTP dead | v2.7.0-2.7.2 的致命 bug：uclient-fetch **没有** --header 选项，v2.7.0 加上的 --header 让所有请求静默失败（usage 错误被 2>/dev/null 吞掉）→ 探测不到劫持页 → 永远不会走认证路径。v2.7.3 已移除全部 --header 用法 |
 | daemon 报 "HTTP dead, ICMP alive" 但不是停机时段 | v2.7.2 起状态与日志区分「停机时段」与「非停机时段（疑似上游 DNS 故障）」；同时修复移动 WiFi 上级路由占用 10.0.0.1 导致退避永不生效的漏洞（现仅劫持跳转/真实可达才复位退避） |
-| 触发「代理行为」封禁 | v2.9.0 起封禁期完全静默且**跨重启持久化**（`/tmp/campus-auth.banuntil`），到期自动恢复；期间 LuCI「立即认证」也会拒绝并提示到期时间——**请勿反复手动尝试**（同 MAC 重复认证会加重标记）。封禁结束后若仍频繁触发：先看 `nft list chain inet fw4 campus_synrate` drop 计数（聚合速率是否常态超限），再确认终端是否开着代理/VPN 客户端 |
+| 触发「代理行为」封禁 | v2.9.0 起封禁期完全静默且**跨重启持久化**（`/tmp/campus-auth.banuntil`），到期自动恢复；期间 LuCI「立即认证」也会拒绝并提示到期时间——**请勿反复手动尝试，更不要换 MAC 重试**（AC 的 randomMacTrace/macChange 专项追踪 MAC 变更，换 MAC 本身就是加重标记的行为；v2.10 已在 MAC 页红字警告）。封禁结束后若仍频繁触发：先看 `nft list chain inet fw4 campus_synrate` drop 计数（聚合速率是否常态超限），再确认终端是否开着代理/VPN 客户端，最后确认 WAN MAC 是全球单播（`ip link show wan`，第一字节第二位十六进制应为 0/4/8/c 结尾——LAA 形态如 56:xx 会被标记） |
 | 刷后 LAN 不通 / 拿不到 IP | `logread -e campus-fw4guard` —— v2.7.1 起规则集加载失败会自动隔离 `/etc/nftables.d/` 下全部 drop-in 并按原厂防火墙起网（日志可见），LAN 永不再因规则挂掉 |
 | 改 MAC 后无法上网 | 认证会话绑旧 MAC——认证页重新登录 |
 | 「校园网 MAC」页点「生成」报 MAC 生成失败（Network 面板看 rpcd 应答正常） | v2.8.1 已修：前端 rpc.declare 的 `expect:{'mac':''}` 把应答解包成裸字符串，`ret.mac` 为 undefined 走了失败分支（livemac 同因致「实际 MAC」恒显未知）。改 `expect:{}` 取完整对象 |
@@ -184,7 +186,9 @@ files/
 │   └── 30-campus-synrate.nft       # 聚合 LAN SYN 速率上限（v2.9.0 单条灰度，stateless limit）
 └── etc/uci-defaults/
     ├── 89-campus-fw4guard           # fw4 规则集自检：加载失败自动隔离 drop-in（保 LAN 永不死）
-    ├── 95-campus-mac-luci           # LuCI「Campus MAC」页面
+    ├── 93-campus-auth               # 自动认证 daemon + LuCI 认证页 + rpcd 后端（v2.10 浏览器会话形态）
+    ├── 94-campus-luci-i18n          # LuCI 默认简体中文
+    ├── 95-campus-mac-luci           # LuCI「Campus MAC」页面（v2.10 起生成全球单播 OUI MAC）
     ├── 96-campus-ntp-server         # 路由器自身 ntpd 开 LAN 监听
     ├── 97-campus-wan-hygiene        # TCP 栈参数（WAN MAC 走 uci，无需重放）
     ├── 98-campus-dhcp-fingerprint   # DHCP 指纹伪装
@@ -227,3 +231,4 @@ files/
 | v2.9.0 | 反「代理行为」检测第二波（v2.8.x 仍触发封禁、普通浏览场景、保守灰度策略）：①新增 `30-campus-synrate.nft` 单条灰度——LAN 聚合 SYN 速率上限 40/s（burst 100），多设备突发叠加是 NAT 后最主要的速率类签名；刻意用 stateless `limit`（全桥单令牌桶=校方看到的聚合形态，per-host meter 管不住聚合）而非 meter/ct-count-in-set（v2.7.0 内核兼容事故教训），超限丢包 TCP 1s 重传，最坏=轻微延迟永不断连②daemon 稳态快速路径——已在线时每周期只 ping qq.com 一次即过（此前每轮 2 次劫持探测 HTTP + 1 次重复 check_online，全是非人类流量签名）；劫持探测只在掉线/首认时跑③check_online 单周期缓存（PRECHECK_RAN/PRECHECK_RC）消除同轮重复探测④封禁截止时间持久化到 /tmp/campus-auth.banuntil：AC 封禁是 MAC 级且比 daemon 活得久，v2.8.0 的 BAN_UNTIL 只在内存——procd respawn/重启即撞回封禁期继续 quickauth 加重标记；现在启动即恢复、到期自动清档，主循环顶端零探测静默门 + rpcd「立即认证」按钮封禁期直接拒绝（ucode 无 time() 内建，走 popen date；int('')=null 参与比较恒真的陷阱已防护）⑤抖动 ±20%→±35% 并修复单侧钳位 bug（v2.7.0 起 `[ $s -lt 0 ] && s=0` 把负半轴砍掉，抖动只剩 +0~+20%、基准 90s 仍可预测；混合源补 date +%M）⑥LuCI 新增 ban-expired 状态标签 |
 | v2.9.1 | 两项首刷体验修复（v2.9.0 实测反馈）：①默认时区 UTC→Asia/Shanghai（CST-8，写 zonename+timezone 双字段对齐 LuCI 手动选时区的落盘方式；镜像无 tzdata 故用 posix TZ 串），并首刷当场生效（重写 /etc/TZ + 重启 sysntpd）；NTP 服务器改国内源（ntp.aliyun.com/ntp1.aliyun.com/ntp.tencent.com/time.apple.com）——openwrt.pool.ntp.org 在校园线刚上线时刻（DNS 未通）常同步失败，导致时钟停在 RTC 旧值（实测首刷后慢了 15 个月），错误墙钟会让运行时段/星期闸门与封禁到期 epoch 计算全部失真②fw4guard 首刷缺口：uci-defaults（S10）里 enable 创建的 S18 软链赶不上本次开机的启动序列——守卫实际从第二次开机才在岗，最危险的首刷那次 fw4 裸加载 drop-in 无人看守（v2.7.0 正是首刷炸的）；现在同款干跑校验内联进 S10 当场执行（fw4 print 不依赖 fw4 已启动），失败当场隔离，S19 的 fw4 拿到的要么是已验证规则集要么是原厂规则集 |
 | v2.9.2 | 代码审查修复波（纯缺陷/安全，不动网络面规则）：①**fw4guard 的 S18 守卫从未执行过**——生成的 init 只定义了 `start_service()` 却没 `USE_PROCD=1`，而 rc.common 第 11 行自带默认 `start() { return 0 }`、只在 `[ -n "$USE_PROCD" ]` 块（第 121 行）里才被覆盖 → `S18campus-fw4guard boot` 全程空转；叠加 `/etc/init.d/boot` 的 `( . "$file" ) && rm -f "$file"` 会在首刷后删掉 uci-defaults，v2.9.1 的内联检查也只跑一次——整套 v2.7.0 事故建立的安全网实际上只存在过一次开机（已用实机 rootfs 的 rc.common 搭测试台复现：旧版 fw4/nft/logger 调用次数 0，新版 3 次且失败时正确隔离）；改为直接定义 `start()`（sysfixtime/sysctl/led 同款非-procd 惯例），并让首刷内联检查直接 `campus-fw4guard start` 调用同一份代码——两份重复逻辑正是 S18 那份默默烂掉的原因②**rpcd ucode root 命令注入**：`login`/`logout` 用字符串拼接造 `popen` 命令行，而 `enc()` 不编码 `'`、portal 返回的 `wlanuserip/wlanacname/mac/vlan/serverip` 完全未编码、`logout` 里 `userid` 裸拼，`jget()` 的 `[^"]*` 又允许单引号——portal 是明文 HTTP，宿舍 ARP 欺骗/恶意上游即可控制这些字节，管理员点一次「立即认证」就在 rpcd 里以 root 执行任意命令（负向对照已实测：修复前 `/tmp/PWNED_root_shell` 被创建，修复后整个 URL 成为单个 argv）；新增 `shq()`（与 stock `usr/share/rpcd/ucode/luci` 的 `shellquote` 同形），所有插值统一过 `shq`/`enc`，`popen` 收敛到 `run()` 做 null 防护（旧 `exec.read()` 未防护，与 v2.8.0 修 rotate 同类）③**LuCI 存储型 XSS**：状态串里嵌的 portal `message/wlanuserip/wlanacname` 与 notification 里的 `code/message` 未转义就进了 `innerHTML`（已核实：luci.js `DOM.append` 对**单个字符串** children 走 `node.innerHTML`、数组才走 `createTextNode`；ui.js `addNotification` 把 children 不包数组直接传给 `dom.append`）；新增 `esc()` 在全部 sink 转义（`stat.label` 也需要：raw 不以 `[a-z-]` 开头时正则失配，head 会退化成整个 raw）④**`json_get` 贪婪冒号导致封禁检测可能失效**：`s/.*://` 吃到最后一个冒号，AC 文案如「代理行为检测:请联系网络中心」会被截成「请联系网络中心」→ 关键词丢失 → `BAN_SECONDS=0` → 守护进程在整个封禁期继续打 quickauth、每轮重新标记 MAC（正是封禁逻辑要防的）；改为锚定第一个冒号 + 只剥尾部分隔符（附带修好值内逗号被 `s/[\",}]//g` 删光）⑤**sysctl 全部不持久化**：uci-defaults 首刷后自删，`sysctl -qw` 只作用于当次运行、重启即回退；而且 4 条里 3 条本就是内核/`10-default.conf` 默认值（已比对实机：icmp_echo_ignore_broadcasts、tcp_timestamps 在 stock conf 里）；改写 `/etc/sysctl.d/99-campus.conf`（S11sysctl 每次开机加载，99- 排在 stock 10-/11- 之后故能覆盖），唯一真正偏离 stock 的 `rp_filter` 从 1（strict）降为 2（loose）——Linux 取 `max(all, <iface>)`，all=1 会把严格模式强加到包括 WAN 的每个接口，而非对称路由/PPPoE 拨号/会话中途默认路由翻转正是它要丢包的场景⑥**INTERVAL 未校验导致忙等死循环**：`uci get` 对「选项存在但值为空」输出空串且退出码 0，`\|\| echo 90` 兜底不触发 → disabled/paused 分支的裸 `sleep "$INTERVAL"` 变成 `sleep ""` 立即失败 → 单核 100% 空转；LuCI 的 range(30,3600) 挡不住 `uci set ... ''`；现在 `read_config` 统一校验并钳到 ≥30⑦**`/etc/init.d/sysntpd started` 不是合法 rc.common 动作**：ALL_COMMANDS 里没有 `started`，rc.common 末尾 `list_contains ... \|\| action=help` 把它变成打印用法并返回 0 → `&&` 恒真，restart 无条件执行且 help 文本污染 uci-defaults 输出；sysntpd 有 `USE_PROCD=1`，正确探活是 `running`⑧**`.gitattributes` 首行 `*. text eol=lf` 是笔误**：`*.` 匹配的是「以点结尾」的文件名（已验证：`git check-attr` 对 `foo.` 命中、对 `foo` 返回 unspecified），所有无扩展名的 uci-defaults 脚本和 `.nft` 都拿不到 eol 属性，在 Windows 上退回 `core.autocrlf=true` 被写成 CRLF（实测 93/98 已中招，仅因 git 归一化而在 `git status` 里看不出）——uci-defaults 是被 `. "$file"` sourced 的，行尾 `\r` 会并入 token（`mkdir -p /etc/init.d\r` 会建出带回车的目录），heredoc 产物也会带 CRLF 导致 `#!/bin/sh\r` bad interpreter；目前未出事只因为 CI 跑在 ubuntu；改为 `* text=auto eol=lf` + 按扩展名兜底 + 二进制显式标记，并把工作区规范回 LF⑨零碎：`jget()` 改 `-?[0-9]+`（旧正则匹配不到 `code=-1`，手动认证失败时 LuCI 显示 `code=null`）；`enc()`/`shq()`/MAC 的 `:` 改写全部改用 `/g` 正则（ucode 的 `replace()` 在 pattern 为字符串时只换第一个，所以旧代码把 MAC 编成了 `AA%3ABB:CC:DD:EE:FF`、密码含两个相同特殊字符时只编码一半）；`status` 里 pidfile 内容先验数字再插值；`is_active_day` 去掉 `${DAYS// /}` bashism（等价于 `[ -z "$DAYS" ]`，已逐取值验证） |
+| v2.10.0 | 反「代理行为」检测第三波（v2.9.0 实测仍被封 + HAR/portal JS 深挖，锁定**认证客户端签名**为主向量）：①**镜像内置 curl，认证流量改为完整浏览器会话形态**——HAR 证据显示 AC 侧是 S-GDPI 类 DPI 系统，portal 流程为：劫持 JS → GET portal.do（`Set-Cookie: ABMS=<uuid>`，HttpOnly）→ 加载 20+ 静态资产（全部带 ABMS cookie + Referer=portal.do）→ XHR `PortalJsonAction.do?viewStatus=1`（Accept: application/json + X-Requested-With）→ 人填表 ~10s → XHR quickauth（同 XHR 头集 + Cookie）。v2.9.x 的 daemon 用 uclient-fetch（**无 --header/--cookie 能力**，v2.7.0 事故已证明）裸打 PortalJsonAction+quickauth：零页面浏览、零 cookie、零 Referer、Accept: \*/\*、UA 还停在过期的 Chrome/126——五项全是「第三方认证客户端」判据，正是 NAT 指纹全部归一后仍被封的最合理解释。现在：`cf_fetch()` 按 nav/xhr/css/js/img 五种模式发 HAR 逐条对齐的头集，`-c/-b` 同一 jar 还原 ABMS cookie 语义，`--compressed` 透明解压 gzip 应答（本机已验证），UA 统一 Chrome/152；`portal_prelude()` 在认证前 GET portal.do 并拉取前 8 个 css/js 资产（0~2s 间隔），`pre_auth_pause()` 模拟填表间隔（三段 1~3s 抖动，对应 HAR 的 10s）；PortalJsonAction 查询串改为 portal.do 的 `location.search` 原样 + `&viewStatus=1`（与页面 JS 完全一致）；rpcd「立即认证」走同一套（cookie jar 共享），「手动下线」也补 XHR 头集 + Referer=logout.html；无 curl 时全部回退 uclient-fetch 旧形态（绝不传 --header，v2.7.0 防回归有单测锁死）②**IP-ID 改 Windows 式全局递增**——旧 jhash(saddr.daddr) 让每个 (源,目标) 对的 IP-ID **永久恒定**，真实主机绝无此形态，被动 OS 分类器（p0f/S-GDPI）把「IP-ID 恒定」直接判为中间盒改写，与 TTL=128 的 Windows 人设自相矛盾；改 `numgen inc mod 65536`（Windows 全局计数器语义，nft 4.9 起核心表达式，无 set/meter，不涉 v2.7.0 内核兼容雷）③**MAC 策略纠偏**——HAR 显示 AC 返回 `randomMacTrace` 文案、`macChange` 字段，quickauth 应答种 `macAuth=<mac>` 两年期 cookie：随机 MAC 与 MAC 变更史被专项追踪。实测会话 MAC `56:0e:46:...` 是 LAA（rotate 产物），且用户「被封后换 MAC 重试」= 每次变更都重新标记。rotate 改为真实厂商 OUI 池（Intel/Realtek/Dell/VMware/Hyper-V，全部全球单播）+ 随机后 3 字节，首字节强制清 LAA/组播位；MAC 页加红字警告（被封勿换 MAC、建议固定克隆真实 PC MAC）④修复 `Q=$(sed 's/.*portal\..do?//')` 潜伏 bug（v2.7 起）：`\..do?` 在 `\.` 与 `do?` 之间多要求一个字符，对 "portal.do?" 永不匹配 → PortalJsonAction 的 query 被整段双重嵌入、/tmp/campus-auth.params 污染（logout 解析不出 wlanuserip）⑤`read_config` 补 PORTAL_IP 空值兜底（与 INTERVAL 同款 `uci get` 空串陷阱：选项存在但为空时 `\|\| echo` 不触发 → 所有 URL 变 `http:///`）⑥验证：daemon 单元 harness 26 断言 + 集成 harness 22 断言全过（请求序列/头集/cookie jar/封禁持久化/零探测门/回退形态），ucode 经 node --check 等价校验，nft 走 CI dry-run |

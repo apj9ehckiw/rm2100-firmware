@@ -90,10 +90,73 @@ STATUS_FILE=/tmp/campus-auth.status
 # and each attempt during a ban RE-MARKS the MAC (v2.8.0 note). Persist the
 # expiry epoch so any restarted daemon stays silent until it lapses.
 BAN_UNTIL_FILE=/tmp/campus-auth.banuntil
-UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+# v2.10.0: UA 对齐 HAR 实测的当前稳定版 Chrome（旧值 Chrome/126 已落后
+# 一年+，「过期 UA」本身就是自动化客户端的旁证）。
+UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+# 浏览器 Accept 头集（HAR 2026-09-17 逐条抄录；Chrome 对导航/XHR/CSS/JS/
+# 图片发不同的 Accept，混用会立即露馅）：
+ACC_NAV="text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+ACC_XHR="application/json, text/javascript, */*; q=0.01"
+ACC_CSS="text/css,*/*;q=0.1"
+ACC_JS="*/*"
+ACC_IMG="image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+ACC_LANG="zh-CN,zh;q=0.9"
+# ABMS cookie jar：portal.do 的 Set-Cookie: ABMS=<uuid> 必须带到后续所有
+# 请求（HAR 里静态资产和 XHR 全部携带）。curl -c/-b 同一 jar 即浏览器语义。
+CF_JAR=/tmp/campus-auth.cookies
+# curl 存在与否决定认证形态：uclient-fetch 无 --header/--cookie（v2.7.0
+# 教训），裸 quickauth 在 S-GDPI 眼里就是「第三方认证客户端」——没有 ABMS
+# cookie、没有 Referer、没有页面浏览前奏、UA 过期，四项全中。镜像默认装
+# curl（build.yml PACKAGES），此检测只是兜底。
+HAS_CURL=0
+command -v curl >/dev/null 2>&1 && HAS_CURL=1
 
 log() { logger -t campus-auth "$1"; }
 set_status() { echo "$1" > "$STATUS_FILE"; }
+
+# $1 秒 ±50% 的「人类间隔」（资产加载/输入模拟用）。busybox 无 $RANDOM，
+# 与 jittered_sleep 同款 PID+时分秒混合源。0.5s 粒度对 DPI 足够（看的是
+# 会话结构不是毫秒时序）；busybox sleep 不支持小数时整数兜底。
+human_delay() {
+	local base j s
+	base=${1:-2}
+	case "$base" in ''|*[!0-9]*) base=2 ;; esac
+	[ "$base" -lt 1 ] && return 0
+	j=$(( base / 2 ))
+	[ "$j" -lt 1 ] && j=1
+	s=$(( ( $$ * 7 + $(date +%S) * 13 + $(date +%M) * 29 ) % ( j * 2 + 1 ) + base - j ))
+	sleep "$s"
+}
+
+# 统一 fetch：curl 在则发完整浏览器头集，不在则回退 uclient-fetch（旧
+# 形态，尽力而为）。$1=URL $2=mode(nav|xhr|css|js|img) $3=Referer(可选)。
+# 注意：不能给 uclient-fetch 传 --header/--cookie（v2.7.0-2.7.2 全灭事故）。
+# 实现细节：curl 对「-H '名字;'」发空值头、对 -H "" 直接忽略——利用后者
+# 让 nav/xhr 的专属头用变量开关，避免在 shell 里拼带引号空格的条件串
+# （无引号展开会词拆分，把 Accept 值拆烂）。
+cf_fetch() {
+	local url="$1" mode="${2:-nav}" ref="$3" acc h_xhr h_nav h_ref
+	if [ "$HAS_CURL" != "1" ]; then
+		uclient-fetch -q -T 8 --user-agent "$UA" -O - "$url" 2>/dev/null
+		return $?
+	fi
+	case "$mode" in
+		xhr) acc="$ACC_XHR"; h_xhr="X-Requested-With: XMLHttpRequest" ;;
+		css) acc="$ACC_CSS" ;;
+		js)  acc="$ACC_JS" ;;
+		img) acc="$ACC_IMG" ;;
+		*)   acc="$ACC_NAV"; h_nav="Upgrade-Insecure-Requests: 1" ;;
+	esac
+	h_ref=""
+	[ -n "$ref" ] && h_ref="Referer: $ref"
+	curl -sS --compressed --max-time 12 --connect-timeout 8 \
+		-c "$CF_JAR" -b "$CF_JAR" \
+		-H "User-Agent: $UA" \
+		-H "Accept: $acc" \
+		-H "Accept-Language: $ACC_LANG" \
+		-H "$h_xhr" -H "$h_nav" -H "$h_ref" \
+		-O - "$url" 2>/dev/null
+}
 
 # sleep with human-like jitter: a fixed 90s loop is a stopwatch signature.
 # v2.9: widened to ±35% (was ±20%) - with the steady-state probe traffic
@@ -124,6 +187,12 @@ OFFCAMPUS_STRIKES=0
 # refresh uci-derived settings (called each loop iteration)
 read_config() {
 	PORTAL_IP=$(uci -q get campusauth.portal.portal_ip || echo "10.1.110.2")
+	# PORTAL_IP 与 INTERVAL 同病（v2.9.2 教训）：`uci get` 对「选项存在但
+	# 值为空」输出空串且退出码 0，`|| echo` 兜底不触发 → 全部 URL 变成
+	# http:///xxx 静默失败。校验非法即回默认。
+	case "$PORTAL_IP" in
+		''|*[!0-9A-Za-z.:_-]*) PORTAL_IP="10.1.110.2" ;;
+	esac
 	INTERVAL=$(uci -q get campusauth.login.interval || echo "90")
 	# INTERVAL 必须校验：`uci get` 对「选项存在但值为空」的情况输出空串且
 	# 退出码为 0，所以上面那个 `|| echo 90` 兜底根本不会触发。空值/非数字
@@ -229,15 +298,69 @@ looks_like_maintenance_window() {
 	esac
 }
 
-# fetch url -> stdout (uclient-fetch; wget is its alias on OpenWrt).
-# NOTE: uclient-fetch has NO --header option (unlike GNU wget). Passing
-# --header makes it print usage and exit non-zero - v2.7.0/2.7.1 shipped
-# exactly that bug and every fetch silently failed, so the daemon could
-# never see the hijack redirect and auto-auth never ran (log showed the
-# misleading "HTTP dead, ICMP alive"). Only --user-agent is supported;
-# request-header consistency beyond UA has to happen at the client level.
+# fetch url -> stdout.
+# v2.10.0: 委托给 cf_fetch（curl 浏览器头集 / uclient-fetch 回退）。
+# 保留函数名让 probe_params 等调用点不动。
+# 历史教训：uclient-fetch 没有 --header（v2.7.0-2.7.2 传了就 usage 退出、
+# 2>/dev/null 吞错全灭）；curl 侧 --compressed + 显式 Accept-Encoding
+# 会透明解压（quickauth 应答 gzip，json_get 拿到的是明文，已本机验证）。
 fetch() {
-	uclient-fetch -q -T 8 --user-agent "$UA" -O - "$1" 2>/dev/null
+	cf_fetch "$1" "${2:-nav}" "${3:-}"
+}
+
+# v2.10.0: 完整浏览器前奏——「像人一样打开门户再认证」。
+# S-GDPI 对 quickauth 的行为画像里，脚本客户端与浏览器的差别不在单个包，
+# 而在会话结构：浏览器必然先 GET portal.do（导航头集）→ 拿 Set-Cookie
+# ABMS → 加载 20+ 个 CSS/JS/图片静态资产（全部带 ABMS cookie 和 Referer）
+# → XHR 查 PortalJsonAction → 人才点登录 → XHR quickauth。旧版 daemon 直接
+# 裸打 PortalJsonAction+quickauth：零页面浏览、零静态资产、零 cookie、
+# 请求间隔恒定——每一项都是「第三方认证客户端」的判据。
+# 参数：$1=portal.do 完整 URL（来自劫持跳转，HAR 确认其中已含
+# rand=<15hex>&url=<encoded 原始URL>，与浏览器完全一致）。
+# 无 curl 时静默跳过（uclient-fetch 无法带 cookie/Referer，前奏形不成）。
+portal_prelude() {
+	[ "$HAS_CURL" = "1" ] || return 0
+	local pdl="$1" html
+	# 每次认证都是新会话：清旧 jar，让 AC 看到 portal.do 重新发 ABMS
+	rm -f "$CF_JAR" 2>/dev/null
+	html=$(cf_fetch "$pdl" nav "http://${GATEWAY_PROBED:-3.3.3.3}/")
+	[ -z "$html" ] && return 1
+	# 从 HTML 提取静态资产并逐个拉取。busybox grep 的 BRE `\|` 交替不可
+	# 依赖（GNU 扩展），统一用 -E；先抓所有 href/src 值，再用 case 过滤
+	# css/js。只拉前 8 个：完整资产列表里的 banner/cmcc 大图共 3.3MB，
+	# 登录前奏不需要图片全量（浏览器懒加载图片也常见）。
+	local ref="$pdl" n=0 a u
+	for a in $(echo "$html" | grep -oE '(href|src)="[^"]+"' | sed 's/^[^"]*"//;s/"$//' | head -40); do
+		case "$a" in
+			*.css*|*.js*) ;;
+			*) continue ;;
+		esac
+		[ "$n" -ge 8 ] && break
+		case "$a" in
+			http*) u="$a" ;;
+			/*) u="http://$PORTAL_IP$a" ;;
+			*) u="http://$PORTAL_IP/$a" ;;
+		esac
+		case "$a" in
+			*.css*) cf_fetch "$u" css "$ref" >/dev/null 2>&1 ;;
+			*) cf_fetch "$u" js "$ref" >/dev/null 2>&1 ;;
+		esac
+		n=$(( n + 1 ))
+		# 资产加载间隔 0~2s（浏览器是并行+流式，这里串行拉开即可，
+		# 恒定 0 间隔反而像压测）
+		human_delay 2
+	done
+	[ "$n" -eq 0 ] && return 1
+	return 0
+}
+
+# 模拟「人填表再点登录」的输入间隔（HAR：页面打开 05:43:30 → quickauth
+# 05:43:40，10 秒）。0 秒 = 自动化签名；固定 10s = 秒表签名；三段
+# 1~3s 抖动（合计 3~9s）覆盖人类区间。
+pre_auth_pause() {
+	human_delay 2
+	human_delay 2
+	human_delay 2
 }
 
 # probe the hijack gateway to learn our session params:
@@ -256,6 +379,10 @@ fetch() {
 PROBE_REDIRECT=""
 PROBE_HTTP=0
 PROBE_NOTE=""
+# v2.10.0: 记录是哪个网关应答了劫持（3.3.3.3 或 10.0.0.1）。浏览器的
+# portal.do 导航带 Referer: http://<劫持网关>/（HAR entry 1 实测），
+# portal_prelude 用它还原同一形态。
+GATEWAY_PROBED=""
 # hijack probe targets, in order. The AC hijacks ANY http:// request on port
 # 80 while the session is unauthenticated (the campus notice board itself
 # tells users to type http://3.3.3.3 to reach the portal). 10.0.0.1 was the
@@ -273,9 +400,13 @@ probe_params() {
 	PROBE_REDIRECT=""
 	PROBE_HTTP=0
 	PROBE_NOTE=""
+	GATEWAY_PROBED=""
 	for p in $HIJACK_PROBES; do
-		body=$(fetch "http://$p/") || body=""
-		[ -n "$body" ] && PROBE_HTTP=1
+		# nav 模式：浏览器访问 http://3.3.3.3 就是一次导航（Accept
+		# text/html + Upgrade-Insecure-Requests），劫持应答的 portal.do
+		# URL 从跳转 JS 里 grep 出来
+		body=$(fetch "http://$p/" nav) || body=""
+		[ -n "$body" ] && { PROBE_HTTP=1; GATEWAY_PROBED="$p"; }
 		redirect=$(echo "$body" | grep -o 'http://[^"]*portal\.do[^"]*' | head -1)
 		if [ -n "$redirect" ]; then
 			# While AUTHENTICATED the same probe targets redirect to the
@@ -400,9 +531,12 @@ tcp_ok() {
 }
 
 # GET PortalJsonAction.do and echo raw JSON
+# v2.10.0: XHR 形态（浏览器里这是 portal.do 页面的 jQuery ajax 调用：
+# Accept: application/json + X-Requested-With + Referer=portal.do + ABMS
+# cookie）。$1=query，$2=Referer（portal.do URL）。
 portal_status() {
-	local url="$1"
-	fetch "http://$PORTAL_IP/PortalJsonAction.do?$url&viewStatus=1"
+	local url="$1" ref="$2"
+	fetch "http://$PORTAL_IP/PortalJsonAction.do?$url&viewStatus=1" xhr "$ref"
 }
 
 # percent-encode chars that break query strings (& % + # space etc.)
@@ -670,10 +804,25 @@ while true; do
 		continue
 	fi
 
-	Q=$(echo "$REDIRECT" | sed 's/.*portal\..do?//')
+	# v2.10.0 修正 sed 潜伏 bug（v2.7 起）：旧模式 `portal\..do?` 在
+	# `\.` 与 `do?` 之间多要求一个任意字符，对 "portal.do?" 永不匹配 →
+	# sed 空转 → Q 是完整 URL → PortalJsonAction 查询串变成
+	# "?http://10.1.110.2/portal.do?wlanuserip=..."（双重嵌入，与浏览器
+	# 的 location.search 原样形态不同，且 /tmp/campus-auth.params 被污染，
+	# logout 解析不出 wlanuserip）。正确剥到第一个 portal.do? 之后。
+	Q=$(echo "$REDIRECT" | sed 's/.*portal\.do?//')
 	echo "$Q" > /tmp/campus-auth.params
 
-	JSON=$(portal_status "$Q")
+	# v2.10.0 浏览器前奏：先「打开」portal.do 页面（拿 ABMS cookie +
+	# 加载 CSS/JS 静态资产），让 quickauth 之前存在完整的页面浏览会话。
+	# 前奏失败（portal.do 拉不到）不阻断认证——旧行为本来就没有前奏，
+	# 有 cookie 拿不到总比连认证都不试强；但记日志便于排查。
+	if ! portal_prelude "$REDIRECT"; then
+		log "portal prelude incomplete (portal.do or assets unreachable); authenticating anyway"
+	fi
+
+	# XHR 的 Referer 就是 portal.do 完整 URL（浏览器形态）
+	JSON=$(portal_status "$Q" "$REDIRECT")
 	if [ -n "$JSON" ]; then
 		TIMESTAMP=$(json_get "$JSON" timestamp)
 		UUID=$(json_get "$JSON" uuid)
@@ -693,7 +842,11 @@ while true; do
 		USERID_ENC=$(urlencode "$USERID")
 		PASSWD_ENC=$(urlencode "$PASSWD")
 		AUTH_URL="http://$PORTAL_IP/quickauth.do?userid=$USERID_ENC&passwd=$PASSWD_ENC&wlanuserip=$USERIP&wlanacname=$ACNAME&wlanacIp=$ACIP&ssid=&vlan=$VLAN&mac=$MAC_ENC&version=0&portalpageid=1&timestamp=$TIMESTAMP&uuid=$UUID&portaltype=0&hostname=&bindCtrlId="
-		RESP=$(fetch "$AUTH_URL")
+		# 模拟人填表→点登录的间隔（HAR：页面打开到 quickauth 相隔 10s）
+		pre_auth_pause
+		# XHR 形态：quickauth 是页面里 async:false 的 jQuery ajax GET，
+		# 带 Accept: application/json + X-Requested-With + Referer + ABMS cookie
+		RESP=$(fetch "$AUTH_URL" xhr "$REDIRECT")
 		CODE=$(json_get "$RESP" code)
 		MSG=$(json_get "$RESP" message)
 
@@ -801,7 +954,14 @@ import { readfile, popen } from 'fs';
 import { cursor } from 'uci';
 
 const q = "'";
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+// v2.10.0: UA 对齐 HAR 实测当前稳定版（与 daemon 同步维护；旧 126 过期）
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36';
+// 浏览器 Accept 头集（HAR 逐条抄录，导航/XHR 形态不同，混用露馅）
+const ACC_NAV = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7';
+const ACC_XHR = 'application/json, text/javascript, */*; q=0.01';
+// ABMS cookie jar（与 daemon 同路径：手动登录接着 daemon 的前奏会话，
+// 两条路径在 AC 眼里都是「浏览器会话」）
+const CF_JAR = '/tmp/campus-auth.cookies';
 
 // v2.9.2 SECURITY: shell-quote a string for safe interpolation into a
 // popen() command line. Everything handed to popen() below is built by
@@ -855,12 +1015,71 @@ function run(cmd) {
 	return out ?? '';
 }
 
+// v2.10.0: 浏览器头集 fetch（curl 主 / uclient-fetch 回退）。
+// 镜像内 curl 由 build.yml PACKAGES 保证存在；回退分支保留是因为
+// sysupgrade 之外手工 opkg remove 之类的边缘情况不该把手动登录整个打挂。
+// uclient-fetch 无 --header/--cookie（v2.7.0-2.7.2 事故），回退形态=旧版裸请求。
+function cf_fetch(url, mode, referer) {
+	mode = mode ?? 'nav';
+	if (!trim(run('command -v curl 2>/dev/null') ?? ''))
+		return run('uclient-fetch -q -T 8 --user-agent ' + shq(UA) + ' -O - ' + shq(url) + ' 2>/dev/null') ?? '';
+
+	let acc = ACC_NAV, extra = [];
+	// extra 只装「头名: 值」串，-H 前缀在拼接循环里统一加（v2.10.0 初稿
+	// 误把 '-H' 也 push 进数组，循环会再补一个 -H 前缀 → `-H '-H'` 把下一
+	// 个参数整个吃掉）。
+	if (mode == 'xhr') {
+		acc = ACC_XHR;
+		push(extra, 'X-Requested-With: XMLHttpRequest');
+	} else if (mode == 'nav') {
+		push(extra, 'Upgrade-Insecure-Requests: 1');
+	} else if (mode == 'css') {
+		acc = 'text/css,*/*;q=0.1';
+	} else if (mode == 'js') {
+		acc = '*/*';
+	}
+	let cmd = 'curl -sS --compressed --max-time 12 --connect-timeout 8' +
+		' -c ' + shq(CF_JAR) + ' -b ' + shq(CF_JAR) +
+		' -H ' + shq('User-Agent: ' + UA) +
+		' -H ' + shq('Accept: ' + acc) +
+		' -H ' + shq('Accept-Language: zh-CN,zh;q=0.9');
+	if (referer)
+		cmd += ' -H ' + shq('Referer: ' + referer);
+	for (let e in extra)
+		cmd += ' -H ' + shq(e);
+	cmd += ' -O - ' + shq(url) + ' 2>/dev/null';
+	return run(cmd) ?? '';
+}
+
 function fetch(url) {
-	// uclient-fetch has NO --header option (v2.7.0-2.7.2 bug: passing it
-	// made every fetch fail with a usage error, so the LuCI login button
-	// and the daemon both silently broke). UA-only request.
-	return run('uclient-fetch -q -T 8 --user-agent ' + shq(UA) +
-		' -O - ' + shq(url) + ' 2>/dev/null') ?? '';
+	// 旧签名兼容（logout 等调用点）：默认导航形态
+	return cf_fetch(url, 'nav', null);
+}
+
+// 浏览器前奏（与 daemon portal_prelude 同构）：GET portal.do（导航头集，
+// 拿 ABMS cookie）→ 加载页面前 8 个 css/js 资产（带 cookie+Referer）。
+// 目的：让 quickauth 之前存在真实页面会话，消除「零浏览直接认证」签名。
+// 注意：ucode 迭代全部匹配要用 rmatch（match 只回第一个；match 循环改串
+// 的写法在 ucode 里没有 lastindex 语义）。
+function portal_prelude(portal_url, portal_ip, gateway) {
+	run('rm -f ' + shq(CF_JAR) + ' 2>/dev/null');
+	let html = cf_fetch(portal_url, 'nav', 'http://' + (gateway ?? '3.3.3.3') + '/');
+	if (!html)
+		return false;
+	let refs = rmatch(html, /(?:href|src)\s*=\s*"([^"]+\.(?:css|js)[^"]*)"/g) ?? [];
+	let n = 0;
+	for (let m in refs) {
+		if (n >= 8)
+			break;
+		let a = m[1];
+		// match() 判形态（与全文件风格一致；`~` 是 ucode 专有运算符，
+		// 语法等价但 CI 侧无法用 node --check 校验）
+		let u = match(a, /^https?:/) ? a
+			: 'http://' + portal_ip + (match(a, /^\//) ? '' : '/') + a;
+		cf_fetch(u, match(a, /\.css/) ? 'css' : 'js', portal_url);
+		n++;
+	}
+	return n > 0;
 }
 
 function jget(json, key) {
@@ -871,7 +1090,13 @@ function jget(json, key) {
 	// json_get handled it correctly, which is why only the manual button lied).
 	let re = regexp('"' + key + '"\\s*:\\s*("([^"]*)"|-?[0-9]+|true|false|null)');
 	let m = match(json, re);
-	return m ? (m[2] ?? m[1]) : null;
+	if (!m)
+		return null;
+	// m[2] 是引号内内容；注意 JSON null 字面量（message:null）不带引号，
+	// 走的是 m[1]='null' 分支——旧写法 `m[2] ?? m[1]` 会把字符串 "null"
+	// 当值返回（LuCI 下线失败通知可能显示「：null」）。真 null 才回 null。
+	let v = m[2] ?? m[1];
+	return (v == 'null' && m[2] == null) ? null : v;
 }
 
 // rpcd ucode plugins must return:
@@ -957,32 +1182,32 @@ return {
 				// While authenticated the probes redirect to the LOGOUT page
 				// (portalLogout.do) - that is not a login hijack, skip it.
 				let redirect = null;
+				let gw = null;
 				for (let probe in ['3.3.3.3', '10.0.0.1']) {
-					let body = fetch('http://' + probe + '/');
+					let body = cf_fetch('http://' + probe + '/', 'nav', null);
 					let m = match(body ?? '', /http:\/\/[^"']*portal\.do\?[^"']*/);
 					if (m && !match(m[0], /[Ll]ogout/)) {
 						redirect = m;
+						gw = probe;
 						break;
 					}
 				}
 				if (!redirect)
 					return { code: null, error: '无法获取认证参数（可能已在线或网关不可达）' };
 
-				let qp = split(substr(redirect[0], index(redirect[0], '?') + 1), '&');
-				let params = {};
-				for (let kv in qp) {
-					let i = index(kv, '=');
-					if (i > 0)
-						params[substr(kv, 0, i)] = substr(kv, i + 1);
-				}
+				// v2.10.0 浏览器前奏：portal.do 页面 + 静态资产 + ABMS cookie
+				// （与 daemon portal_prelude 同构；失败不阻断认证）
+				portal_prelude(redirect[0], portal_ip, gw);
 
+				// v2.10.0: 浏览器形态是 window.location.search 原样 +
+				// &viewStatus=1（portalUtil.js 实测），即 portal.do 的完整
+				// query（含 rand=/url=/hostname=）。旧版只回传子集参数，
+				// 与页面 JS 的真实请求形状不同。
+				let fullq = substr(redirect[0], index(redirect[0], '?') + 1);
 				let url = 'http://' + portal_ip + '/PortalJsonAction.do?' +
-					'wlanuserip=' + (params.wlanuserip ?? '') +
-					'&wlanacname=' + (params.wlanacname ?? '') +
-					'&mac=' + (params.mac ?? '') +
-					'&vlan=' + (params.vlan ?? '') +
-					'&viewStatus=1';
-				let json = fetch(url);
+					fullq + '&viewStatus=1';
+				// XHR 形态 + Referer=portal.do（浏览器 ajax 同款）
+				let json = cf_fetch(url, 'xhr', redirect[0]);
 				if (!json)
 					return { code: null, error: 'PortalJsonAction 无响应' };
 
@@ -1009,7 +1234,9 @@ return {
 					'&mac=' + replace(enc(mac ?? ''), /:/g, '%3A') + '&version=0&portalpageid=1' +
 					'&timestamp=' + enc(ts) + '&uuid=' + enc(uuid) +
 					'&portaltype=0&hostname=&bindCtrlId=';
-				let resp = fetch(auth_url);
+				// XHR 形态 + Referer=portal.do（浏览器里 quickauth 是页面内
+				// async:false 的 jQuery ajax GET；前奏已在上面完成）
+				let resp = cf_fetch(auth_url, 'xhr', redirect[0]);
 				let code = jget(resp, 'code');
 				let message = jget(resp, 'message');
 
@@ -1032,9 +1259,6 @@ return {
 				}
 
 				let url = 'http://' + portal_ip + '/quickauthdisconn.do';
-				// no --header here either: uclient-fetch rejects it (see
-				// fetch() above) and the logout would silently fail
-				//
 				// portaltype: the stock logout page sends getParam('portaltype')
 				// which is ABSENT from the logout.html URL - i.e. an EMPTY
 				// string. v2.7.3 and earlier hard-coded '0' here and the AC
@@ -1049,11 +1273,26 @@ return {
 					'&wlanacname=' + (p.wlanacname ?? '') +
 					'&version=0&portaltype=&userid=' + enc(userid) +
 					'&mac=' + (p.mac ?? '') + '&groupId=' + enc(args?.groupId ?? '2');
-				// run()：旧代码的 exec.read('all') 没做 null 防护，popen 失败会
-				// 直接抛异常杀掉整个 rpcd 方法（与 v2.8.0 修 rotate 同类）。
-				let out = run('uclient-fetch -q -T 8 --user-agent ' + shq(UA) +
-					' --post-data=' + shq(post) +
-					' -O - ' + shq(url) + ' 2>/dev/null') ?? '';
+				// v2.10.0: 下线是 logout.html 页面里的 jQuery ajax POST
+				// （portalUtil.js disconnSubmit()：type post / dataType json /
+				// 默认 form-urlencoded）。curl -d 自带
+				// Content-Type: application/x-www-form-urlencoded，与 jQuery
+				// 一致；XHR 头集 + Referer=logout.html 还原页面上下文。
+				// run()：popen 失败返回 null，?? '' 兜底（v2.9.2 语义保留）。
+				let logout_ref = 'http://' + portal_ip +
+					'/portal/usertemp_computer/zhongshanlg-pc/logout.html?' + qp;
+				let cmd = 'command -v curl >/dev/null 2>&1 && ' +
+					'curl -sS --compressed --max-time 12 --connect-timeout 8' +
+					' -c ' + shq(CF_JAR) + ' -b ' + shq(CF_JAR) +
+					' -H ' + shq('User-Agent: ' + UA) +
+					' -H ' + shq('Accept: ' + ACC_XHR) +
+					' -H ' + shq('Accept-Language: zh-CN,zh;q=0.9') +
+					' -H ' + shq('X-Requested-With: XMLHttpRequest') +
+					' -H ' + shq('Referer: ' + logout_ref) +
+					' -d ' + shq(post) + ' ' + shq(url) + ' 2>/dev/null' +
+					' || uclient-fetch -q -T 8 --user-agent ' + shq(UA) +
+					' --post-data=' + shq(post) + ' -O - ' + shq(url) + ' 2>/dev/null';
+				let out = run(cmd) ?? '';
 				return { code: jget(out, 'code'), message: jget(out, 'message') };
 			}
 		}
