@@ -30,14 +30,21 @@ chain campus_ttl_postrouting {
 # Mechanism: hosts pick IP-ID by different algorithms (per-flow counter,
 # global counter, random). Behind one router, forwarded flows from different
 # OSes produce mixed IP-ID patterns on one source IP - a strong statistical
-# signal that many cheap detectors use. Setting a per-flow random-looking but
-# consistent ID defeats this. nft has no per-flow random, so use jhash of
-# (saddr, daddr): same flow keeps a stable ID, different flows differ.
-# NOTE: jhash keys are limited to {ip saddr, ip6 daddr, tcp dport, udp sport,
-# ether saddr} concatenated with '.' - "ip proto" is NOT a valid key.
+# signal that many cheap detectors use.
+#
+# v2.10.0: jhash(saddr.daddr) -> numgen inc mod 65536. The old per-(src,dst)
+# constant was ITSELF a fingerprint: a real host never repeats one IP-ID
+# value forever toward the same destination, while any stateless middlebox
+# rewriting IDs does exactly that - passive OS classifiers (p0f & friends,
+# and S-GDPI is a DPI box) score "IP-ID恒定" as a NAT/proxy tell. Windows -
+# the persona this ruleset claims via TTL=128 - uses a GLOBAL incrementing
+# counter wrapping at 65536, and `numgen inc mod 65536` reproduces that
+# shape exactly: every WAN-bound packet gets the next value regardless of
+# flow. numgen is core nft since 4.9 (kernel here is 6.6); no set/meter
+# involved, so the v2.7.0 kernel-rejection class of failure does not apply.
 chain campus_ipid_postrouting {
 	type filter hook postrouting priority mangle + 12; policy accept;
-	oifname != "lo" ip ttl 64-128 ip id set jhash ip saddr . ip daddr mod 65536 counter comment "campus-fix: flow-stable IP-ID"
+	oifname != "lo" ip ttl 64-128 ip id set numgen inc mod 65536 counter comment "campus-fix: Windows-style global incrementing IP-ID"
 }
 
 # ------------------------------------------------------------ DSCP fix

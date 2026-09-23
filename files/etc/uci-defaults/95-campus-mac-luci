@@ -107,13 +107,48 @@ return {
 				if (length(hex) < 12)
 					return { mac: null, error: 'random source failed' };
 
-				// first byte: locally-administered unicast (bit1 set, bit0 clear)
+				// v2.10.0: 生成「真实 PC 网卡」形态的 MAC，不再生成本地管理地址。
+				// 旧版 (b1 | 0x02) 强制置 LAA 位（本地管理），而本校园 AC
+				// （PortalJsonAction 应答里的 randomMacTrace/macChange 字段、
+				// quickauth 的 Set-Cookie: macAuth=<mac> Max-Age=2年）明确在
+				// 追踪随机/变更 MAC——「换过几次 MAC 重试」正是 macChange 检测
+				// 的触发源，每次认证都重新标记。
+				// 改为：从一个常见 Windows 笔电/台机网卡厂商 OUI 里随机挑一个
+				// 作前 3 字节，后 3 字节随机；首字节清掉 LAA(bit1) 与组播(bit0)
+				// → 全球单播地址，看起来就是一台普通 PC。
 				// (ucode builtin is hexdec - hex2dec does not exist)
-				let b1 = (hexdec(substr(hex, 0, 2)) | 0x02) & 0xFE;
-
-				return { mac: sprintf('%02x:%s:%s:%s:%s:%s', b1,
-					substr(hex, 2, 2), substr(hex, 4, 2), substr(hex, 6, 2),
-					substr(hex, 8, 2), substr(hex, 10, 2)) };
+				// 注意：全部选全球单播 OUI（首字节 bit1=0）。QEMU 的
+				// 52:54:00 本身是 LAA，不能用（清了 LAA 位就变成不存在
+				// 的厂商前缀 50:54:00）。
+				const OUIS = [
+					'001b21', // Intel
+					'0025d3', // Aztech / 常见板载
+					'00e04c', // Realtek
+					'a4b197', // 常见笔电
+					'005056', // VMware
+					'000c29', // VMware
+					'3cfdfe', // Intel
+					'f8bc12', // Dell
+					'00155d', // Microsoft Hyper-V
+					'b8ac6f'  // Dell
+				];
+				// 用 hex 尾部做 OUI 选择的熵源（避免再读一次随机）
+				let oui = OUIS[ hexdec(substr(hex, 10, 2)) % length(OUIS) ];
+				// 首字节清 LAA(bit1)+组播(bit0) 位 → 全球单播
+				let b1 = hexdec(substr(oui, 0, 2)) & 0xFC;
+				// v2.10.1 修复：返回标准 xx:xx:xx:xx:xx:xx 冒号分隔格式。
+				// 旧版 sprintf('%02x%s%s', b1, oui[2:6], hex[0:6]) 拼出的是
+				// 12 位连续十六进制（如 "001b21a1b2c3"，无冒号），与页面
+				// 「6 组冒号分隔」的说明矛盾；填进 datatype='macaddr' 输入框、
+				// 写进 uci network.wan.macaddr 后，netifd/内核 sysfs 期望冒号
+				// 格式，无分隔串会导致自定义 MAC 静默不生效（一直是 WAN
+				// 出厂 MAC，rotate 形同虚设）。
+				// oui = 3 字节(前 3 组)，其中首字节已被 b1 覆盖清位；
+				// hex[0:6] = 后 3 字节(后 3 组)。共 6 组冒号分隔。
+				return { mac: sprintf('%02x:%s:%s:%s:%s:%s',
+					b1,
+					substr(oui, 2, 2), substr(oui, 4, 2),
+					substr(hex, 0, 2), substr(hex, 2, 2), substr(hex, 4, 2)) };
 			}
 		}
 	}
@@ -200,7 +235,8 @@ return view.extend({
 			_('<br /><br /><b>格式：</b>6 组冒号分隔的十六进制，如 <code>12:34:56:78:9A:BC</code>。') +
 			_('留空保存即可恢复出厂 WAN MAC。') +
 			_('<br /><br /><b>生效方式：</b><code>ifup wan</code> 或重启。') +
-			_('校园网认证通常与 MAC 绑定——修改后需在认证页重新登录。'));
+			_('校园网认证通常与 MAC 绑定——修改后需在认证页重新登录。') +
+			_('<br /><br /><b style="color:#e03131">警告：本校 AC 会追踪随机/变更 MAC（门户返回 randomMacTrace/macChange 字段，认证后种 macAuth 长效 cookie）。频繁更换 MAC——尤其是被封后立刻换 MAC 重试——会被判定为「代理行为」并加重标记。被封禁时请等待到期，不要换 MAC 绕过。建议：固定使用一个全球单播 MAC（克隆自己电脑的网卡 MAC 最自然），之后不要再变。</b>'));
 
 		s = m.section(form.NamedSection, 'wan', 'interface', _('WAN 接口'));
 

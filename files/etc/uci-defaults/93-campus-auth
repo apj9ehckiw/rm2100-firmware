@@ -89,10 +89,28 @@ STATUS_FILE=/tmp/campus-auth.status
 # respawn (or a reboot) walked straight back into quickauth during the ban -
 # and each attempt during a ban RE-MARKS the MAC (v2.8.0 note). Persist the
 # expiry epoch so any restarted daemon stays silent until it lapses.
-# /etc is on the persistent overlay; /tmp is erased on router reboot.
 BAN_UNTIL_FILE=/etc/campus-auth.banuntil
 LEGACY_BAN_UNTIL_FILE=/tmp/campus-auth.banuntil
-UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+# v2.10.0: UA 对齐 HAR 实测的当前稳定版 Chrome（旧值 Chrome/126 已落后
+# 一年+，「过期 UA」本身就是自动化客户端的旁证）。
+UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+# 浏览器 Accept 头集（HAR 2026-09-17 逐条抄录；Chrome 对导航/XHR/CSS/JS/
+# 图片发不同的 Accept，混用会立即露馅）：
+ACC_NAV="text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+ACC_XHR="application/json, text/javascript, */*; q=0.01"
+ACC_CSS="text/css,*/*;q=0.1"
+ACC_JS="*/*"
+ACC_IMG="image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+ACC_LANG="zh-CN,zh;q=0.9"
+# ABMS cookie jar：portal.do 的 Set-Cookie: ABMS=<uuid> 必须带到后续所有
+# 请求（HAR 里静态资产和 XHR 全部携带）。curl -c/-b 同一 jar 即浏览器语义。
+CF_JAR=/tmp/campus-auth.cookies
+# curl 存在与否决定认证形态：uclient-fetch 无 --header/--cookie（v2.7.0
+# 教训），裸 quickauth 在 S-GDPI 眼里就是「第三方认证客户端」——没有 ABMS
+# cookie、没有 Referer、没有页面浏览前奏、UA 过期，四项全中。镜像默认装
+# curl（build.yml PACKAGES），此检测只是兜底。
+HAS_CURL=0
+command -v curl >/dev/null 2>&1 && HAS_CURL=1
 
 log() { logger -t campus-auth "$1"; }
 set_status() { echo "$1" > "$STATUS_FILE"; }
@@ -113,6 +131,52 @@ persist_ban() (
 
 clear_ban() {
 	rm -f "$BAN_UNTIL_FILE" "$LEGACY_BAN_UNTIL_FILE"
+}
+
+# $1 秒 ±50% 的「人类间隔」（资产加载/输入模拟用）。busybox 无 $RANDOM，
+# 与 jittered_sleep 同款 PID+时分秒混合源。0.5s 粒度对 DPI 足够（看的是
+# 会话结构不是毫秒时序）；busybox sleep 不支持小数时整数兜底。
+human_delay() {
+	local base j s second minute
+	base=${1:-2}
+	case "$base" in ''|*[!0-9]*) base=2 ;; esac
+	[ "$base" -lt 1 ] && return 0
+	j=$(( base / 2 ))
+	[ "$j" -lt 1 ] && j=1
+	second=$(date +%S); minute=$(date +%M)
+	second=${second#0}; minute=${minute#0}
+	s=$(( ( $$ * 7 + second * 13 + minute * 29 ) % ( j * 2 + 1 ) + base - j ))
+	sleep "$s"
+}
+
+# 统一 fetch：curl 在则发完整浏览器头集，不在则回退 uclient-fetch（旧
+# 形态，尽力而为）。$1=URL $2=mode(nav|xhr|css|js|img) $3=Referer(可选)。
+# 注意：不能给 uclient-fetch 传 --header/--cookie（v2.7.0-2.7.2 全灭事故）。
+# 实现细节：curl 对「-H '名字;'」发空值头、对 -H "" 直接忽略——利用后者
+# 让 nav/xhr 的专属头用变量开关，避免在 shell 里拼带引号空格的条件串
+# （无引号展开会词拆分，把 Accept 值拆烂）。
+cf_fetch() {
+	local url="$1" mode="${2:-nav}" ref="$3" acc h_xhr h_nav h_ref
+	if [ "$HAS_CURL" != "1" ]; then
+		uclient-fetch -q -T 8 --user-agent "$UA" -O - "$url" 2>/dev/null
+		return $?
+	fi
+	case "$mode" in
+		xhr) acc="$ACC_XHR"; h_xhr="X-Requested-With: XMLHttpRequest" ;;
+		css) acc="$ACC_CSS" ;;
+		js)  acc="$ACC_JS" ;;
+		img) acc="$ACC_IMG" ;;
+		*)   acc="$ACC_NAV"; h_nav="Upgrade-Insecure-Requests: 1" ;;
+	esac
+	h_ref=""
+	[ -n "$ref" ] && h_ref="Referer: $ref"
+	curl -sS --compressed --max-time 12 --connect-timeout 8 \
+		-c "$CF_JAR" -b "$CF_JAR" \
+		-H "User-Agent: $UA" \
+		-H "Accept: $acc" \
+		-H "Accept-Language: $ACC_LANG" \
+		-H "$h_xhr" -H "$h_nav" -H "$h_ref" \
+		-o - "$url" 2>/dev/null
 }
 
 # sleep with human-like jitter: a fixed 90s loop is a stopwatch signature.
@@ -147,7 +211,23 @@ OFFCAMPUS_STRIKES=0
 # refresh uci-derived settings (called each loop iteration)
 read_config() {
 	PORTAL_IP=$(uci -q get campusauth.portal.portal_ip || echo "10.1.110.2")
+	# PORTAL_IP 与 INTERVAL 同病（v2.9.2 教训）：`uci get` 对「选项存在但
+	# 值为空」输出空串且退出码 0，`|| echo` 兜底不触发 → 全部 URL 变成
+	# http:///xxx 静默失败。校验非法即回默认。
+	case "$PORTAL_IP" in
+		''|*[!0-9A-Za-z.:_-]*) PORTAL_IP="10.1.110.2" ;;
+	esac
 	INTERVAL=$(uci -q get campusauth.login.interval || echo "90")
+	# INTERVAL 必须校验：`uci get` 对「选项存在但值为空」的情况输出空串且
+	# 退出码为 0，所以上面那个 `|| echo 90` 兜底根本不会触发。空值/非数字
+	# 会流到 disabled/paused 分支里的裸 `sleep "$INTERVAL"` —— `sleep ""`
+	# 立刻报错返回，整个 while 变成满速空转（单核 100% + 每轮重写状态
+	# 文件）。LuCI 的 range(30,3600) 数据类型挡不住 `uci set ... ''`。
+	# jittered_sleep 自带同样的校验，这里补齐让所有 sleep 路径都安全。
+	case "$INTERVAL" in
+		''|*[!0-9]*) INTERVAL=90 ;;
+	esac
+	[ "$INTERVAL" -lt 30 ] && INTERVAL=30
 	ENABLED=$(uci -q get campusauth.login.enabled || echo "0")
 	USERID=$(uci -q get campusauth.login.username)
 	PASSWD=$(uci -q get campusauth.login.password)
@@ -155,6 +235,8 @@ read_config() {
 	ACTIVE_END=$(uci -q get campusauth.login.active_end)
 	# day_N: 1 = run on that weekday (date +%w: 0=Sun .. 6=Sat). All unset
 	#   -> every day (fail-open, same policy as the time window).
+	# DAYS 由下面的循环拼出来，只可能是 "" 或 " N N N..."（非空必含数字），
+	# 所以 is_active_day 里的 `[ -z "$DAYS" ]` 与「剥掉空格后判空」完全等价。
 	DAYS=""
 	local d
 	for d in 0 1 2 3 4 5 6; do
@@ -165,7 +247,9 @@ read_config
 
 # Is today an enabled weekday? (empty DAYS -> all days enabled)
 is_active_day() {
-	[ -z "${DAYS// /}" ] && return 0
+	# 不用 ${DAYS// /}：那是 bashism，在 busybox ash 上只因为 OpenWrt 开了
+	# ASH_BASH_COMPAT 才没炸；而这里判空本就等价（见 read_config 注释）。
+	[ -z "$DAYS" ] && return 0
 	case " $DAYS " in
 		*" $(date '+%w') "*) return 0 ;;
 	esac
@@ -238,15 +322,69 @@ looks_like_maintenance_window() {
 	esac
 }
 
-# fetch url -> stdout (uclient-fetch; wget is its alias on OpenWrt).
-# NOTE: uclient-fetch has NO --header option (unlike GNU wget). Passing
-# --header makes it print usage and exit non-zero - v2.7.0/2.7.1 shipped
-# exactly that bug and every fetch silently failed, so the daemon could
-# never see the hijack redirect and auto-auth never ran (log showed the
-# misleading "HTTP dead, ICMP alive"). Only --user-agent is supported;
-# request-header consistency beyond UA has to happen at the client level.
+# fetch url -> stdout.
+# v2.10.0: 委托给 cf_fetch（curl 浏览器头集 / uclient-fetch 回退）。
+# 保留函数名让 probe_params 等调用点不动。
+# 历史教训：uclient-fetch 没有 --header（v2.7.0-2.7.2 传了就 usage 退出、
+# 2>/dev/null 吞错全灭）；curl 侧 --compressed + 显式 Accept-Encoding
+# 会透明解压（quickauth 应答 gzip，json_get 拿到的是明文，已本机验证）。
 fetch() {
-	uclient-fetch -q -T 8 --user-agent "$UA" -O - "$1" 2>/dev/null
+	cf_fetch "$1" "${2:-nav}" "${3:-}"
+}
+
+# v2.10.0: 完整浏览器前奏——「像人一样打开门户再认证」。
+# S-GDPI 对 quickauth 的行为画像里，脚本客户端与浏览器的差别不在单个包，
+# 而在会话结构：浏览器必然先 GET portal.do（导航头集）→ 拿 Set-Cookie
+# ABMS → 加载 20+ 个 CSS/JS/图片静态资产（全部带 ABMS cookie 和 Referer）
+# → XHR 查 PortalJsonAction → 人才点登录 → XHR quickauth。旧版 daemon 直接
+# 裸打 PortalJsonAction+quickauth：零页面浏览、零静态资产、零 cookie、
+# 请求间隔恒定——每一项都是「第三方认证客户端」的判据。
+# 参数：$1=portal.do 完整 URL（来自劫持跳转，HAR 确认其中已含
+# rand=<15hex>&url=<encoded 原始URL>，与浏览器完全一致）。
+# 无 curl 时静默跳过（uclient-fetch 无法带 cookie/Referer，前奏形不成）。
+portal_prelude() {
+	[ "$HAS_CURL" = "1" ] || return 0
+	local pdl="$1" html
+	# 每次认证都是新会话：清旧 jar，让 AC 看到 portal.do 重新发 ABMS
+	rm -f "$CF_JAR" 2>/dev/null
+	html=$(cf_fetch "$pdl" nav "http://${GATEWAY_PROBED:-3.3.3.3}/")
+	[ -z "$html" ] && return 1
+	# 从 HTML 提取静态资产并逐个拉取。busybox grep 的 BRE `\|` 交替不可
+	# 依赖（GNU 扩展），统一用 -E；先抓所有 href/src 值，再用 case 过滤
+	# css/js。只拉前 8 个：完整资产列表里的 banner/cmcc 大图共 3.3MB，
+	# 登录前奏不需要图片全量（浏览器懒加载图片也常见）。
+	local ref="$pdl" n=0 a u
+	for a in $(echo "$html" | grep -oE '(href|src)="[^"]+"' | sed 's/^[^"]*"//;s/"$//' | head -40); do
+		case "$a" in
+			*.css*|*.js*) ;;
+			*) continue ;;
+		esac
+		[ "$n" -ge 8 ] && break
+		case "$a" in
+			http*) u="$a" ;;
+			/*) u="http://$PORTAL_IP$a" ;;
+			*) u="http://$PORTAL_IP/$a" ;;
+		esac
+		case "$a" in
+			*.css*) cf_fetch "$u" css "$ref" >/dev/null 2>&1 ;;
+			*) cf_fetch "$u" js "$ref" >/dev/null 2>&1 ;;
+		esac
+		n=$(( n + 1 ))
+		# 资产加载间隔 0~2s（浏览器是并行+流式，这里串行拉开即可，
+		# 恒定 0 间隔反而像压测）
+		human_delay 2
+	done
+	[ "$n" -eq 0 ] && return 1
+	return 0
+}
+
+# 模拟「人填表再点登录」的输入间隔（HAR：页面打开 05:43:30 → quickauth
+# 05:43:40，10 秒）。0 秒 = 自动化签名；固定 10s = 秒表签名；三段
+# 1~3s 抖动（合计 3~9s）覆盖人类区间。
+pre_auth_pause() {
+	human_delay 2
+	human_delay 2
+	human_delay 2
 }
 
 # probe the hijack gateway to learn our session params:
@@ -265,6 +403,10 @@ fetch() {
 PROBE_REDIRECT=""
 PROBE_HTTP=0
 PROBE_NOTE=""
+# v2.10.0: 记录是哪个网关应答了劫持（3.3.3.3 或 10.0.0.1）。浏览器的
+# portal.do 导航带 Referer: http://<劫持网关>/（HAR entry 1 实测），
+# portal_prelude 用它还原同一形态。
+GATEWAY_PROBED=""
 # hijack probe targets, in order. The AC hijacks ANY http:// request on port
 # 80 while the session is unauthenticated (the campus notice board itself
 # tells users to type http://3.3.3.3 to reach the portal). 10.0.0.1 was the
@@ -282,9 +424,13 @@ probe_params() {
 	PROBE_REDIRECT=""
 	PROBE_HTTP=0
 	PROBE_NOTE=""
+	GATEWAY_PROBED=""
 	for p in $HIJACK_PROBES; do
-		body=$(fetch "http://$p/") || body=""
-		[ -n "$body" ] && PROBE_HTTP=1
+		# nav 模式：浏览器访问 http://3.3.3.3 就是一次导航（Accept
+		# text/html + Upgrade-Insecure-Requests），劫持应答的 portal.do
+		# URL 从跳转 JS 里 grep 出来
+		body=$(fetch "http://$p/" nav) || body=""
+		[ -n "$body" ] && { PROBE_HTTP=1; GATEWAY_PROBED="$p"; }
 		redirect=$(echo "$body" | grep -o 'http://[^"]*portal\.do[^"]*' | head -1)
 		if [ -n "$redirect" ]; then
 			# While AUTHENTICATED the same probe targets redirect to the
@@ -409,9 +555,12 @@ tcp_ok() {
 }
 
 # GET PortalJsonAction.do and echo raw JSON
+# v2.10.0: XHR 形态（浏览器里这是 portal.do 页面的 jQuery ajax 调用：
+# Accept: application/json + X-Requested-With + Referer=portal.do + ABMS
+# cookie）。$1=query，$2=Referer（portal.do URL）。
 portal_status() {
-	local url="$1"
-	fetch "http://$PORTAL_IP/PortalJsonAction.do?$url&viewStatus=1"
+	local url="$1" ref="$2"
+	fetch "http://$PORTAL_IP/PortalJsonAction.do?$url&viewStatus=1" xhr "$ref"
 }
 
 # percent-encode chars that break query strings (& % + # space etc.)
@@ -421,8 +570,17 @@ urlencode() {
 
 json_get() {
 	# json_get '<json>' '<key>' -> value (simple regex, no shell json deps)
+	#
+	# 两处 sed 都必须精确，历史版本两个都错：
+	#  1) 剥 key 前缀要用锚定的 `^[^:]*:`（第一个冒号），不能是贪婪的
+	#     `.*:`（最后一个冒号）。AC 的封禁文案形如 "代理行为检测:请联系
+	#     网络中心" 时，贪婪版把关键词一起吃掉 -> case 匹配不到 ->
+	#     BAN_SECONDS 保持 0 -> 守护进程在整个封禁期继续打 quickauth，
+	#     每轮都重新标记 MAC（正是封禁逻辑要避免的事）。
+	#  2) 收尾用 `s/[,}]$//` + 去外层引号，而不是 `s/[\",}]//g`。后者会
+	#     把值内部的逗号也删光，status 里展示的 message 失真。
 	echo "$1" | grep -o "\"$2\"[[:space:]]*:[[:space:]]*\"\{0,1\}[^\"]*\"*[,}]" \
-		| head -1 | sed "s/.*:[[:space:]]*//;s/[\",}]//g"
+		| head -1 | sed "s/^[^:]*:[[:space:]]*//;s/[,}]\$//;s/^\"//;s/\"\$//"
 }
 
 AUTH_OK=0
@@ -675,11 +833,26 @@ while true; do
 		continue
 	fi
 
+	# v2.10.0 修正 sed 潜伏 bug（v2.7 起）：旧模式 `portal\..do?` 在
+	# `\.` 与 `do?` 之间多要求一个任意字符，对 "portal.do?" 永不匹配 →
+	# sed 空转 → Q 是完整 URL → PortalJsonAction 查询串变成
+	# "?http://10.1.110.2/portal.do?wlanuserip=..."（双重嵌入，与浏览器
+	# 的 location.search 原样形态不同，且 /tmp/campus-auth.params 被污染，
+	# logout 解析不出 wlanuserip）。正确剥到第一个 portal.do? 之后。
 	Q=${REDIRECT#*\?}
 	Q=${Q%%\#*}
 	echo "$Q" > /tmp/campus-auth.params
 
-	JSON=$(portal_status "$Q")
+	# v2.10.0 浏览器前奏：先「打开」portal.do 页面（拿 ABMS cookie +
+	# 加载 CSS/JS 静态资产），让 quickauth 之前存在完整的页面浏览会话。
+	# 前奏失败（portal.do 拉不到）不阻断认证——旧行为本来就没有前奏，
+	# 有 cookie 拿不到总比连认证都不试强；但记日志便于排查。
+	if ! portal_prelude "$REDIRECT"; then
+		log "portal prelude incomplete (portal.do or assets unreachable); authenticating anyway"
+	fi
+
+	# XHR 的 Referer 就是 portal.do 完整 URL（浏览器形态）
+	JSON=$(portal_status "$Q" "$REDIRECT")
 	if [ -n "$JSON" ]; then
 		TIMESTAMP=$(json_get "$JSON" timestamp)
 		UUID=$(json_get "$JSON" uuid)
@@ -699,7 +872,11 @@ while true; do
 		USERID_ENC=$(urlencode "$USERID")
 		PASSWD_ENC=$(urlencode "$PASSWD")
 		AUTH_URL="http://$PORTAL_IP/quickauth.do?userid=$USERID_ENC&passwd=$PASSWD_ENC&wlanuserip=$USERIP&wlanacname=$ACNAME&wlanacIp=$ACIP&ssid=&vlan=$VLAN&mac=$MAC_ENC&version=0&portalpageid=1&timestamp=$TIMESTAMP&uuid=$UUID&portaltype=0&hostname=&bindCtrlId="
-		RESP=$(fetch "$AUTH_URL")
+		# 模拟人填表→点登录的间隔（HAR：页面打开到 quickauth 相隔 10s）
+		pre_auth_pause
+		# XHR 形态：quickauth 是页面里 async:false 的 jQuery ajax GET，
+		# 带 Accept: application/json + X-Requested-With + Referer + ABMS cookie
+		RESP=$(fetch "$AUTH_URL" xhr "$REDIRECT")
 		CODE=$(json_get "$RESP" code)
 		MSG=$(json_get "$RESP" message)
 
@@ -806,36 +983,149 @@ cat > /usr/share/rpcd/ucode/campusauth <<'UCEOF'
 import { readfile, popen } from 'fs';
 import { cursor } from 'uci';
 
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+const q = "'";
+// v2.10.0: UA 对齐 HAR 实测当前稳定版（与 daemon 同步维护；旧 126 过期）
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36';
+// 浏览器 Accept 头集（HAR 逐条抄录，导航/XHR 形态不同，混用露馅）
+const ACC_NAV = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7';
+const ACC_XHR = 'application/json, text/javascript, */*; q=0.01';
+// ABMS cookie jar（与 daemon 同路径：手动登录接着 daemon 的前奏会话，
+// 两条路径在 AC 眼里都是「浏览器会话」）
+const CF_JAR = '/tmp/campus-auth.cookies';
 
-// URL encoding does not quote a shell argument. Apply this to every
-// dynamic argument passed to popen, including server-supplied fields.
-function shellquote(s) {
-	return "'" + replace(s ?? '', /'/g, "'\\''") + "'";
+// v2.9.2 SECURITY: shell-quote a string for safe interpolation into a
+// popen() command line. Everything handed to popen() below is built by
+// string concatenation, and the values come from TWO untrusted sources:
+//   - the plaintext-HTTP portal reply (wlanuserip / wlanacname / mac /
+//     vlan / serverip). jget()'s `[^\"]*` happily returns values containing
+//     a single quote, so anyone who can answer PortalJsonAction.do (ARP
+//     spoof on the dorm LAN, a rogue upstream, a MITM'd portal) could break
+//     out of the '...' quoting and run arbitrary shell AS ROOT inside rpcd
+//     the moment an admin clicked "立即认证".
+//   - UCI credentials. enc() below percent-encodes for the URL but did NOT
+//     cover `'`, so a password like O'brien both broke login and injected.
+// Inside single quotes sh performs no expansion at all, so the only char that
+// needs handling is `'` itself - close, escape, reopen (`'\''`).
+function shq(s) {
+	// /g 是故意的：ucode 的 replace() 在 pattern 为字符串时只替换第一个
+	// 匹配，用字符串模式会让第二个及以后的单引号全部漏网（shellquote 就白做
+	// 了）。stock fw4.uc 也是靠 regex + /g 做这件事。
+	return q + replace(s ?? '', /'/g, q + '\\' + q + q) + q;
 }
 
 function enc(s) {
-	// percent-encode query-string-hostile chars (covers typical passwords)
-	return replace(replace(replace(replace(replace(replace(s ?? '', '%', '%25'), '&', '%26'), '+', '%2B'), '#', '%23'), ' ', '%20'), '?', '%3F');
+	// percent-encode query-string-hostile chars.
+	//   - 全部用 /g 正则而不是字符串模式：字符串模式只换第一个，密码含两个
+	//     相同特殊字符（a%b%c、a&b&c）时只能编码一半，送到 quickauth 的凭据
+	//     默默就错了。
+	//   - `%` 必须第一个替换：它是下面每条规则引入的转义字符，顺序错了会
+	//     二次编码。
+	//   - `'` 也编码：它在 URL value 里没有语义，编了之后即使调用方漏写
+	//     shq() 也不会变成活字符。
+	s = s ?? '';
+	s = replace(s, /%/g, '%25');
+	s = replace(s, /&/g, '%26');
+	s = replace(s, /\+/g, '%2B');
+	s = replace(s, /#/g, '%23');
+	s = replace(s, / /g, '%20');
+	s = replace(s, /\?/g, '%3F');
+	s = replace(s, /'/g, '%27');
+	return s;
 }
 
-function fetch(url) {
-	// uclient-fetch has NO --header option (v2.7.0-2.7.2 bug: passing it
-	// made every fetch fail with a usage error, so the LuCI login button
-	// and the daemon both silently broke). UA-only request.
-	let p = popen('uclient-fetch -q -T 8 --user-agent ' + shellquote(UA) + ' -O - ' + shellquote(url) + ' 2>/dev/null');
+// popen() wrapper: ucode's popen returns null on failure, and an unguarded
+// p.read() then throws and kills the whole rpcd method - the exact failure
+// mode v2.8.0 fixed in campusmac.rotate. Never call popen() directly here.
+function run(cmd) {
+	let p = popen(cmd);
 	if (!p)
-		return '';
+		return null;
 	let out = p.read('all');
 	p.close();
 	return out ?? '';
 }
 
+// v2.10.0: 浏览器头集 fetch（curl 主 / uclient-fetch 回退）。
+// 镜像内 curl 由 build.yml PACKAGES 保证存在；回退分支保留是因为
+// sysupgrade 之外手工 opkg remove 之类的边缘情况不该把手动登录整个打挂。
+// uclient-fetch 无 --header/--cookie（v2.7.0-2.7.2 事故），回退形态=旧版裸请求。
+function cf_fetch(url, mode, referer) {
+	mode = mode ?? 'nav';
+	if (!trim(run('command -v curl 2>/dev/null') ?? ''))
+		return run('uclient-fetch -q -T 8 --user-agent ' + shq(UA) + ' -O - ' + shq(url) + ' 2>/dev/null') ?? '';
+
+	let acc = ACC_NAV, extra = [];
+	// extra 只装「头名: 值」串，-H 前缀在拼接循环里统一加（v2.10.0 初稿
+	// 误把 '-H' 也 push 进数组，循环会再补一个 -H 前缀 → `-H '-H'` 把下一
+	// 个参数整个吃掉）。
+	if (mode == 'xhr') {
+		acc = ACC_XHR;
+		push(extra, 'X-Requested-With: XMLHttpRequest');
+	} else if (mode == 'nav') {
+		push(extra, 'Upgrade-Insecure-Requests: 1');
+	} else if (mode == 'css') {
+		acc = 'text/css,*/*;q=0.1';
+	} else if (mode == 'js') {
+		acc = '*/*';
+	}
+	let cmd = 'curl -sS --compressed --max-time 12 --connect-timeout 8' +
+		' -c ' + shq(CF_JAR) + ' -b ' + shq(CF_JAR) +
+		' -H ' + shq('User-Agent: ' + UA) +
+		' -H ' + shq('Accept: ' + acc) +
+		' -H ' + shq('Accept-Language: zh-CN,zh;q=0.9');
+	if (referer)
+		cmd += ' -H ' + shq('Referer: ' + referer);
+	for (let e in extra)
+		cmd += ' -H ' + shq(e);
+	cmd += ' -o - ' + shq(url) + ' 2>/dev/null';
+	return run(cmd) ?? '';
+}
+
+function fetch(url) {
+	// 旧签名兼容（logout 等调用点）：默认导航形态
+	return cf_fetch(url, 'nav', null);
+}
+
+// 浏览器前奏（与 daemon portal_prelude 同构）：GET portal.do（导航头集，
+// 拿 ABMS cookie）→ 加载页面前 8 个 css/js 资产（带 cookie+Referer）。
+// 目的：让 quickauth 之前存在真实页面会话，消除「零浏览直接认证」签名。
+// ucode match(..., /.../g) returns an array of capture arrays.
+function portal_prelude(portal_url, portal_ip, gateway) {
+	run('rm -f ' + shq(CF_JAR) + ' 2>/dev/null');
+	let html = cf_fetch(portal_url, 'nav', 'http://' + (gateway ?? '3.3.3.3') + '/');
+	if (!html)
+		return false;
+	let refs = match(html, /(href|src)\s*=\s*"([^"]+\.(css|js)[^"]*)"/g) ?? [];
+	let n = 0;
+	for (let m in refs) {
+		if (n >= 8)
+			break;
+		let a = m[2];
+		// match() 判形态（与全文件风格一致；`~` 是 ucode 专有运算符，
+		// 语法等价但 CI 侧无法用 node --check 校验）
+		let u = match(a, /^https?:/) ? a
+			: 'http://' + portal_ip + (match(a, /^\//) ? '' : '/') + a;
+		cf_fetch(u, match(a, /\.css/) ? 'css' : 'js', portal_url);
+		n++;
+	}
+	return n > 0;
+}
+
 function jget(json, key) {
-	// ucode has no `new RegExp` - use the regexp() builtin instead
-	let re = regexp('"' + key + '"\\s*:\\s*("([^"]*)"|[0-9]+|true|false|null)');
+	// ucode has no `new RegExp` - use the regexp() builtin instead.
+	// v2.9.2: `-?[0-9]+` - the portal answers a failed login with code=-1 and
+	// the old `[0-9]+` did not match it, so jget returned null and LuCI showed
+	// "认证失败（code=null）" instead of the real -1 (the daemon's shell-side
+	// json_get handled it correctly, which is why only the manual button lied).
+	let re = regexp('"' + key + '"\\s*:\\s*("([^"]*)"|-?[0-9]+|true|false|null)');
 	let m = match(json, re);
-	return m ? (m[2] ?? m[1]) : null;
+	if (!m)
+		return null;
+	// m[2] 是引号内内容；注意 JSON null 字面量（message:null）不带引号，
+	// 走的是 m[1]='null' 分支——旧写法 `m[2] ?? m[1]` 会把字符串 "null"
+	// 当值返回（LuCI 下线失败通知可能显示「：null」）。真 null 才回 null。
+	let v = m[2] ?? m[1];
+	return (v == 'null' && m[2] == null) ? null : v;
 }
 
 // rpcd ucode plugins must return:
@@ -856,13 +1146,11 @@ return {
 				// pgrep -x would never match - check the pidfile instead.
 				let running = false;
 				let pid = trim(readfile('/var/run/campus-auth.pid') ?? '');
-				if (pid) {
-					let p = popen('kill -0 ' + shellquote(pid) + ' 2>/dev/null && echo up');
-					if (p) {
-						running = trim(p.read('all') ?? '') == 'up';
-						p.close();
-					}
-				}
+				// 先验数字再插值到命令行（pidfile 虽然只有 root 能写，但 procd
+				// stop 时不保证清理它，陈旧/异常内容不能直接拼进 shell）；
+				// 走 run() 让 popen 失败降级为 running=false 而不是抛异常。
+				if (pid && match(pid, /^[0-9]+$/))
+					running = trim(run('kill -0 ' + pid + ' 2>/dev/null && echo up') ?? '') == 'up';
 
 				if (!running && st == '')
 					st = '未运行（未启用自动认证）';
@@ -905,14 +1193,12 @@ return {
 				// int('') returns null and null < N is numerically TRUE in
 				// ucode, so both sides must be null-checked or a popen
 				// failure would wrongly block login forever.
-				// Legacy fallback protects a live daemon until it restarts
-				// and migrates its old /tmp record onto the overlay.
 				let ban_until = trim(readfile('/etc/campus-auth.banuntil') ??
 					readfile('/tmp/campus-auth.banuntil') ?? '');
 				if (ban_until && match(ban_until, /^[0-9]+$/)) {
-					let p = popen('echo "$(date +%s) $(date -d @' + ban_until + ' "+%H:%M:%S" 2>/dev/null)"');
-					let out = trim(p ? (p.read('all') ?? '') : '');
-					if (p) p.close();
+					// ban_until 已被上面的 ^[0-9]+$ 卡死，插值安全；run() 保证
+					// popen 失败时返回空串而不是抛异常。
+					let out = trim(run('echo "$(date +%s) $(date -d @' + ban_until + ' "+%H:%M:%S" 2>/dev/null)"') ?? '');
 					let parts = split(out, ' ');
 					let now_s = int(parts[0]);
 					let until_s = int(ban_until);
@@ -926,32 +1212,32 @@ return {
 				// While authenticated the probes redirect to the LOGOUT page
 				// (portalLogout.do) - that is not a login hijack, skip it.
 				let redirect = null;
+				let gw = null;
 				for (let probe in ['3.3.3.3', '10.0.0.1']) {
-					let body = fetch('http://' + probe + '/');
+					let body = cf_fetch('http://' + probe + '/', 'nav', null);
 					let m = match(body ?? '', /http:\/\/[^"']*portal\.do\?[^"']*/);
 					if (m && !match(m[0], /[Ll]ogout/)) {
 						redirect = m;
+						gw = probe;
 						break;
 					}
 				}
 				if (!redirect)
 					return { code: null, error: '无法获取认证参数（可能已在线或网关不可达）' };
 
-				let qp = split(substr(redirect[0], index(redirect[0], '?') + 1), '&');
-				let params = {};
-				for (let kv in qp) {
-					let i = index(kv, '=');
-					if (i > 0)
-						params[substr(kv, 0, i)] = substr(kv, i + 1);
-				}
+				// v2.10.0 浏览器前奏：portal.do 页面 + 静态资产 + ABMS cookie
+				// （与 daemon portal_prelude 同构；失败不阻断认证）
+				portal_prelude(redirect[0], portal_ip, gw);
 
+				// v2.10.0: 浏览器形态是 window.location.search 原样 +
+				// &viewStatus=1（portalUtil.js 实测），即 portal.do 的完整
+				// query（含 rand=/url=/hostname=）。旧版只回传子集参数，
+				// 与页面 JS 的真实请求形状不同。
+				let fullq = substr(redirect[0], index(redirect[0], '?') + 1);
 				let url = 'http://' + portal_ip + '/PortalJsonAction.do?' +
-					'wlanuserip=' + (params.wlanuserip ?? '') +
-					'&wlanacname=' + (params.wlanacname ?? '') +
-					'&mac=' + (params.mac ?? '') +
-					'&vlan=' + (params.vlan ?? '') +
-					'&viewStatus=1';
-				let json = fetch(url);
+					fullq + '&viewStatus=1';
+				// XHR 形态 + Referer=portal.do（浏览器 ajax 同款）
+				let json = cf_fetch(url, 'xhr', redirect[0]);
 				if (!json)
 					return { code: null, error: 'PortalJsonAction 无响应' };
 
@@ -966,14 +1252,21 @@ return {
 				if (!ts || !uuid)
 					return { code: null, error: 'portal 配置解析失败' };
 
+				// v2.9.2: 每一个插值字段都过 enc()。这些值全部来自明文 HTTP 的
+				// portal 应答，属于外部可影响输入；旧代码把它们裸拼，一个 `'`
+				// 就能穿透 popen 的单引号包裹在 rpcd 里以 root 执行（见 shq()）。
+				// MAC 的 `:` -> `%3A` 也必须用 /g：旧的字符串模式只改第一个
+				// 冒号，手动认证实际发的是 mac=AA%3ABB:CC:DD:EE:FF。
 				let auth_url = 'http://' + portal_ip + '/quickauth.do?userid=' + enc(userid) +
 					'&passwd=' + enc(passwd) +
-					'&wlanuserip=' + userip + '&wlanacname=' + acname +
-					'&wlanacIp=' + acip + '&ssid=&vlan=' + vlan +
-					'&mac=' + replace(mac ?? '', ':', '%3A') + '&version=0&portalpageid=1' +
-					'&timestamp=' + ts + '&uuid=' + uuid +
+					'&wlanuserip=' + enc(userip) + '&wlanacname=' + enc(acname) +
+					'&wlanacIp=' + enc(acip) + '&ssid=&vlan=' + enc(vlan) +
+					'&mac=' + replace(enc(mac ?? ''), /:/g, '%3A') + '&version=0&portalpageid=1' +
+					'&timestamp=' + enc(ts) + '&uuid=' + enc(uuid) +
 					'&portaltype=0&hostname=&bindCtrlId=';
-				let resp = fetch(auth_url);
+				// XHR 形态 + Referer=portal.do（浏览器里 quickauth 是页面内
+				// async:false 的 jQuery ajax GET；前奏已在上面完成）
+				let resp = cf_fetch(auth_url, 'xhr', redirect[0]);
 				let code = jget(resp, 'code');
 				let message = jget(resp, 'message');
 
@@ -996,25 +1289,40 @@ return {
 				}
 
 				let url = 'http://' + portal_ip + '/quickauthdisconn.do';
-				// no --header here either: uclient-fetch rejects it (see
-				// fetch() above) and the logout would silently fail
-				//
 				// portaltype: the stock logout page sends getParam('portaltype')
 				// which is ABSENT from the logout.html URL - i.e. an EMPTY
 				// string. v2.7.3 and earlier hard-coded '0' here and the AC
 				// answered code=1 (下线失败); mirror the stock client exactly.
-				let data = 'wlanacip=' + (p.wlanacip ?? '10.1.110.3') +
+				// v2.9.2: 先拼好 body 字符串，再整体 shq() 一次。旧代码把
+				// userid（UCI 原文）和 /tmp/campus-auth.params 里的值直接插进
+				// '...' 字面量，任何位置一个单引号就能逆出引用并以 root 执行。
+				// 注意：p.* 已由守护进程做过 URL 编码，不能再过 enc()（会把 %
+				// 二次编码成 %25）；userid 是 UCI 原文，必须过。
+				let post = 'wlanacip=' + (p.wlanacip ?? '10.1.110.3') +
 					'&wlanuserip=' + (p.wlanuserip ?? '') +
 					'&wlanacname=' + (p.wlanacname ?? '') +
 					'&version=0&portaltype=&userid=' + enc(userid) +
 					'&mac=' + (p.mac ?? '') + '&groupId=' + enc(args?.groupId ?? '2');
-				let cmd = 'uclient-fetch -q -T 8 --user-agent ' + shellquote(UA) +
-					' --post-data=' + shellquote(data) + ' -O - ' + shellquote(url) + ' 2>/dev/null';
-				let exec = popen(cmd);
-				if (!exec)
-					return { code: null, error: '无法启动下线请求' };
-				let out = exec.read('all');
-				exec.close();
+				// v2.10.0: 下线是 logout.html 页面里的 jQuery ajax POST
+				// （portalUtil.js disconnSubmit()：type post / dataType json /
+				// 默认 form-urlencoded）。curl -d 自带
+				// Content-Type: application/x-www-form-urlencoded，与 jQuery
+				// 一致；XHR 头集 + Referer=logout.html 还原页面上下文。
+				// run()：popen 失败返回 null，?? '' 兜底（v2.9.2 语义保留）。
+				let logout_ref = 'http://' + portal_ip +
+					'/portal/usertemp_computer/zhongshanlg-pc/logout.html?' + qp;
+				let cmd = 'command -v curl >/dev/null 2>&1 && ' +
+					'curl -sS --compressed --max-time 12 --connect-timeout 8' +
+					' -c ' + shq(CF_JAR) + ' -b ' + shq(CF_JAR) +
+					' -H ' + shq('User-Agent: ' + UA) +
+					' -H ' + shq('Accept: ' + ACC_XHR) +
+					' -H ' + shq('Accept-Language: zh-CN,zh;q=0.9') +
+					' -H ' + shq('X-Requested-With: XMLHttpRequest') +
+					' -H ' + shq('Referer: ' + logout_ref) +
+					' -d ' + shq(post) + ' ' + shq(url) + ' 2>/dev/null' +
+					' || uclient-fetch -q -T 8 --user-agent ' + shq(UA) +
+					' --post-data=' + shq(post) + ' -O - ' + shq(url) + ' 2>/dev/null';
+				let out = run(cmd) ?? '';
 				return { code: jget(out, 'code'), message: jget(out, 'message') };
 			}
 		}
@@ -1110,6 +1418,38 @@ function validateHHMM(section_id, value) {
 	return true;
 }
 
+// v2.9.2 SECURITY: HTML-escape at the sink.
+//
+// Every value this view interpolates that does NOT originate in this file is
+// attacker-influenced: the daemon status line embeds the portal's `message`,
+// `wlanuserip` and `wlanacname`, and the login/logout replies carry the
+// portal's `code`/`message`. The portal is plaintext HTTP, so whoever can
+// answer it (ARP spoof on the dorm LAN, a rogue upstream, a MITM'd AC)
+// controls those bytes.
+//
+// Both sinks really do parse HTML - verified against 24.10's shipped LuCI:
+//   - luci.js DOM.append(node, children): an ARRAY child is appended element
+//     by element and anything non-element goes through
+//     document.createTextNode() (safe), but a SINGLE STRING child takes the
+//     `node.innerHTML = children` branch. form.Map's description is passed
+//     as one string -> innerHTML. (This is also why the footer version
+//     stamp's <span> renders.)
+//   - ui.js addNotification(title, children) calls
+//     dom.append(msg.firstElementChild, children) with children NOT wrapped
+//     in an array, so a string notification body hits innerHTML too.
+// So an unescaped `message` was a stored XSS against the admin session.
+//
+// stat.label needs it as well: when raw does not start with [a-z-], the
+// regex fails and statusLine falls back to `head = raw` (the whole string).
+function esc(s) {
+	return String(s == null ? '' : s)
+		.replace(/&/g, '&amp;')
+		.replace(/</g, '&lt;')
+		.replace(/>/g, '&gt;')
+		.replace(/"/g, '&quot;')
+		.replace(/'/g, '&#39;');
+}
+
 return view.extend({
 	load: function() {
 		return L.resolveDefault(callStatus(), {});
@@ -1171,9 +1511,9 @@ return view.extend({
 		m = new form.Map('campusauth', _('校园网认证'),
 			_('校园网 Portal 自动认证（抓包逆向实现）。保存凭据并启用后，后台服务会自动登录并掉线重连。') +
 			_('<br /><br />当前状态：<span style="color:%s;%s">%s</span>（后台服务：%s）<br /><code style="font-size:0.85em">%s</code>')
-				.format(color, weight, stat.label,
+				.format(color, weight, esc(stat.label),
 					(st.running === true) ? _('运行中') : _('未运行'),
-					stat.detail) +
+					esc(stat.detail)) +
 			(stat.isBanned
 				? _('<br /><b style="color:#e03131">注意：触发代理行为检测已被封禁。封禁期间同 MAC 重复尝试认证会加重标记，守护进程已静默等待，请勿手动点击「登录」。到期后自动恢复。</b>')
 				: ''));
@@ -1245,10 +1585,10 @@ return view.extend({
 					ui.addNotification(null, _('已在线，无需重复认证。'), 'info');
 				}
 				else if (ret && ret.error) {
-					ui.addNotification(null, _('认证失败：%s').format(ret.error), 'error');
+					ui.addNotification(null, _('认证失败：%s').format(esc(ret.error)), 'error');
 				}
 				else {
-					ui.addNotification(null, _('认证失败（code=%s）：可能是学号密码错误或需要设备绑定。').format(ret ? ret.code : '?'), 'error');
+					ui.addNotification(null, _('认证失败（code=%s）：可能是学号密码错误或需要设备绑定。').format(ret ? esc(ret.code) : '?'), 'error');
 				}
 			});
 		};
@@ -1265,8 +1605,10 @@ return view.extend({
 					// surface the portal's own message alongside the code:
 					// "code=1" alone told us nothing while debugging the
 					// portaltype mismatch (v2.7.4)
-					var why = (ret && ret.message) ? _('：%s').format(ret.message) : '';
-					ui.addNotification(null, _('下线失败（code=%s）%s').format(ret ? ret.code : '?', why), 'error');
+					// esc(): ret.message/ret.code are portal-controlled and
+					// addNotification puts a string body through innerHTML.
+					var why = (ret && ret.message) ? _('：%s').format(esc(ret.message)) : '';
+					ui.addNotification(null, _('下线失败（code=%s）%s').format(ret ? esc(ret.code) : '?', why), 'error');
 				}
 			});
 		};

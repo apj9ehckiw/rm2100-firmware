@@ -1,5 +1,34 @@
-*. text eol=lf
-*.sh text eol=lf
-*.yml text eol=lf
-files/etc/uci-defaults/* text eol=lf
-tests/*.py text eol=lf
+# v2.9.2: 首行原本是 `*. text eol=lf` —— `*.` 这个 pattern 匹配的是「以点
+# 结尾」的文件名（`foo.`），不是所有文件。后果：所有无扩展名的 uci-defaults
+# 脚本和 .nft 文件都拿不到 eol 属性（`git check-attr` 返回 unspecified），
+# 在 Windows 上退回由 core.autocrlf=true 接管，工作区被写成 CRLF。
+#
+# 为什么这很危险：uci-defaults 脚本是被 /etc/init.d/boot 用 `. "$file"`
+#  sourced 的，行尾的 \r 会并入 token —— `mkdir -p /etc/init.d\r` 会建出一个
+# 名字里带回车的目录，`exit 0\r` 直接报错；heredoc 生成的 /usr/bin/campus-auth
+# 也会带上 CRLF，`#!/bin/sh\r` -> bad interpreter，守护进程根本起不来。
+# 目前没出事只因为 CI 跑在 ubuntu-24.04（autocrlf 默认不转），但任何一次
+# 本地 Windows 构建/打包都会把 CRLF 直接烧进固件。
+#
+# text=auto：让 git 按内容自动判定文本/二进制（不要写成裸 `text`，那会把
+# 二进制也当文本处理）；eol=lf：工作区也强制 LF，不受 core.autocrlf 影响。
+* text=auto eol=lf
+
+# 显式兜底（即使上面的通配规则被改动，这些也保持 LF）
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.nft  text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.js   text eol=lf
+*.uc   text eol=lf
+
+# 固件/抓包等二进制绝不做行尾转换
+*.bin      binary
+*.ipk      binary
+*.img      binary
+*.squashfs binary
+*.har      binary
+*.png      binary
+*.jpg      binary

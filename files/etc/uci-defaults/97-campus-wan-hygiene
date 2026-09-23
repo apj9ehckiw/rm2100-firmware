@@ -9,12 +9,61 @@
 #    The factory Xiaomi OUI is a weak signal; if the campus flags it, use the
 #    LuCI "校园网 MAC" page to clone a PC MAC or rotate (custom MACs persist
 #    directly in uci - network.wan.macaddr; nothing else to replay at boot).
+#
+# v2.9.2: THE SYSCALLS WERE NEVER PERSISTENT. This is a uci-defaults script,
+# and /etc/init.d/boot runs each one as `( . "./$file" ) && rm -f "$file"` -
+# i.e. it executes EXACTLY ONCE, on first boot, then deletes itself. The old
+# version called `sysctl -qw ...` directly, so the values applied to that one
+# boot and silently reverted on every reboot afterwards.
+#
+# Fix: write a drop-in under /etc/sysctl.d/. S11sysctl (which runs right
+# after this S10boot) does:
+#     for CONF in /etc/sysctl.d/*.conf /etc/sysctl.conf; do sysctl -e -p "$CONF"; done
+# so it is re-applied on every boot, and because 99- sorts after the stock
+# 10-default.conf / 11-nf-conntrack.conf it also wins over them.
+# A sysupgrade re-runs this script (the uci-defaults file ships inside the
+# rootfs image, so wiping the overlay restores it), which recreates the conf.
 
-# --- TCP/IP stack hygiene (applies to forwarded + router-origin traffic)
-sysctl -qw net.ipv4.tcp_timestamps=1
-sysctl -qw net.ipv4.tcp_window_scaling=1
-sysctl -qw net.ipv4.icmp_echo_ignore_broadcasts=1
-sysctl -qw net.ipv4.conf.all.rp_filter=1
+CONF=/etc/sysctl.d/99-campus.conf
+
+mkdir -p /etc/sysctl.d
+cat > "$CONF" <<'SYSEOF'
+# campus-fix WAN hygiene (written by /etc/uci-defaults/97-campus-wan-hygiene)
+# Loaded on every boot by S11sysctl; sorts after the stock 10-default.conf so
+# these values win. Edit HERE, not with `sysctl -w` (that is lost on reboot).
+
+# --- already the stock/kernel default, re-asserted explicitly -------------
+# Both are present in OpenWrt's own /etc/sysctl.d/10-default.conf
+# (tcp_timestamps=1 at line 23, icmp_echo_ignore_broadcasts=1 at line 17) and
+# tcp_window_scaling is a kernel default. Kept so the intent is auditable in
+# one place and cannot drift if a future OpenWrt changes its defaults; they
+# are deliberately NOT the reason this file exists.
+net.ipv4.tcp_timestamps=1
+net.ipv4.tcp_window_scaling=1
+net.ipv4.icmp_echo_ignore_broadcasts=1
+
+# --- the one setting that actually differs from stock ---------------------
+# Reverse-path filtering. NOT set anywhere in the stock config, so it sat at
+# the kernel default (0) after every reboot before v2.9.2.
+#
+# Value is 2 (LOOSE), not 1 (STRICT). Linux resolves the effective per-
+# interface setting as max(conf.all.rp_filter, conf.<iface>.rp_filter), so
+# all=1 would force strict mode on EVERY interface including WAN. Strict mode
+# drops any packet whose source is not reachable back through the interface it
+# arrived on - that is exactly the shape of asymmetric routing, PPPoE dial-up
+# and mid-session default-route flips, all of which happen on campus lines.
+# Given this project's history (v2.7.0 bricked LANs), loose mode is the right
+# trade: it still blocks plainly-spoofed sources without adding a way for a
+# routing change to black-hole the WAN.
+net.ipv4.conf.all.rp_filter=2
+net.ipv4.conf.default.rp_filter=2
+SYSEOF
+
+# Apply now instead of waiting for S11sysctl. Not strictly required (S11 runs
+# right after this S10boot, same boot), but it keeps this script correct if
+# the boot ordering ever changes and makes `logread` show errors immediately.
+# -e = ignore unknown keys, so a kernel without one of them cannot fail boot.
+sysctl -e -p "$CONF" >/dev/null 2>&1
 
 # --- WAN MAC: no action needed here. Custom MACs set via the LuCI
 # "校园网 MAC" page are persisted directly in uci (network.wan.macaddr),

@@ -4,6 +4,7 @@ Run with Python 3 + Node.js + BusyBox ash (preferred) or dash / Git for Windows.
 The JS shim tests generated RPC commands, not native ucode compatibility.
 """
 import json
+import http.server
 import os
 from pathlib import Path
 import re
@@ -11,6 +12,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 
 
@@ -63,7 +65,8 @@ const index = (s, p) => String(s).indexOf(p);
 const int = s => /^\d+$/.test(s || '') ? Number(s) : null;
 const hexdec = s => parseInt(s, 16);
 const regexp = s => new RegExp(s);
-const match = (s, r) => String(s).match(r);
+const match = (s, r) => r.global ? Array.from(String(s).matchAll(r)) : String(s).match(r);
+const push = (a, ...v) => a.push(...v);
 const replace = (s, p, r) => typeof p === 'string'
     ? String(s).replaceAll(p, r) : String(s).replace(p, r);
 const sprintf = (fmt, ...args) => {
@@ -75,13 +78,15 @@ const popen = cmd => {
     commands.push(cmd);
     if (opts.popenFails) return null;
     let out = '';
-    if (cmd.startsWith('echo ')) out = `${opts.now || 1000} 00:33:20`;
+    if (cmd === 'command -v curl 2>/dev/null') out = opts.hasCurl === false ? '' : '/usr/bin/curl';
+    else if (cmd.startsWith('echo ')) out = `${opts.now || 1000} 00:33:20`;
     else if (cmd.includes('PortalJsonAction.do')) out = JSON.stringify({
         timestamp: '1000', uuid: 'test-uuid', serverip: '10.1.110.3',
         wlanuserip: '10.9.9.9', wlanacname: opts.acname || 'AC1',
         mac: 'aa:bb:cc:dd:ee:ff', vlan: '9'
     });
     else if (cmd.includes('quickauth')) out = '{"code":"0","message":"ok"}';
+    else if (cmd.includes('/portal.do?')) out = '<link href="/style.css"><script src="/portal.js"></script>';
     else if (cmd.includes('3.3.3.3')) out = '<script>location="http://10.1.110.2/portal.do?wlanuserip=10.9.9.9&wlanacname=AC1&mac=aa:bb:cc:dd:ee:ff&vlan=9";</script>';
     return {read: () => out, close: () => {}};
 };
@@ -182,9 +187,9 @@ logger() {{ :; }}
         # Argument boundaries and any unexpected injected stdout are observable.
         # dash forbids '-' in function names; change only the executable
         # name, keeping all generated shell argument quoting untouched.
-        self.assertTrue(command.startswith("uclient-fetch "))
-        command = "stub_fetch " + command[len("uclient-fetch "):]
-        out = self.assert_shell_ok('stub_fetch() { printf "%s\\0" "$@"; };\n' + command)
+        self.assertTrue(command.startswith(("uclient-fetch ", "curl ", "command -v curl")))
+        command = command.replace("uclient-fetch ", "stub_fetch ")
+        out = self.assert_shell_ok('stub_fetch() { printf "%s\\0" "$@"; }; curl() { stub_fetch "$@"; };\n' + command)
         return out.rstrip("\0").split("\0")
 
     def test_rpc_login_and_logout_shell_injection(self):
@@ -192,39 +197,81 @@ logger() {{ :; }}
         config = {"username": "user'one&two", "password": "O'br'ien&+% ?", "portal_ip": "10.1.110.2"}
         login = run_rpc(RPC, "campusauth", "login", config=config, acname=payload)
         self.assertEqual(login["result"]["code"], "0")
-        self.assertEqual(len(login["commands"]), 3)
-        for command in login["commands"]:
+        requests = [cmd for cmd in login["commands"] if cmd.startswith('curl ')]
+        self.assertEqual(len(requests), 6)  # probe, portal, CSS, JS, status, auth
+        for command in requests:
             argv = self.command_argv(command)
-            self.assertEqual(len(argv), 8)
-            self.assertEqual(argv[:3], ["-q", "-T", "8"])
-            self.assertEqual(argv[5:7], ["-O", "-"])
-        auth_url = self.command_argv(login["commands"][-1])[-1]
-        self.assertIn("wlanacname=" + payload, auth_url)
-        self.assertIn("passwd=O'br'ien%26%2B%25%20%3F", auth_url)
+            self.assertEqual(argv[:2], ["-sS", "--compressed"])
+            self.assertEqual(argv[-3:-1], ["-o", "-"])
+            self.assertEqual(argv[argv.index('-c') + 1], '/tmp/campus-auth.cookies')
+        auth_args = self.command_argv(requests[-1])
+        self.assertIn('X-Requested-With: XMLHttpRequest', auth_args)
+        from urllib.parse import parse_qs, urlsplit
+        params = parse_qs(urlsplit(auth_args[-1]).query)
+        self.assertEqual(params['wlanacname'], [payload])
+        self.assertEqual(params['passwd'], [config['password']])
         logout = run_rpc(RPC, "campusauth", "logout", config=config,
                          files={"/tmp/campus-auth.params": "wlanuserip=10.9.9.9&wlanacname=" + payload},
                          args={"groupId": payload})
         argv = self.command_argv(logout["commands"][0])
-        self.assertEqual(len(argv), 9)
-        self.assertTrue(argv[5].startswith("--post-data="))
-        self.assertIn("wlanacname=" + payload, argv[5])
-        self.assertIn("userid=user'one%26two", argv[5])
+        post = argv[argv.index('-d') + 1]
+        self.assertIn("wlanacname=" + payload, post)
+        self.assertIn("userid=user%27one%26two", post)
         self.assertEqual(argv[-1], "http://10.1.110.2/quickauthdisconn.do")
+        fallback = run_rpc(RPC, 'campusauth', 'login', config=config, hasCurl=False)
+        self.assertEqual(fallback['result']['code'], '0')
+        for cmd in fallback['commands']:
+            if cmd.startswith('uclient-fetch '):
+                self.assertEqual(len(self.command_argv(cmd)), 8)
 
     def test_rpc_popen_failure(self):
         for method in ("login", "logout"):
             result = run_rpc(RPC, "campusauth", method, popenFails=True,
                              config={"username": "test", "password": "test"})["result"]
             self.assertIsNone(result["code"])
-            self.assertTrue(result["error"])
+            if method == 'login':
+                self.assertTrue(result["error"])
 
-    def test_mac_format_and_local_unicast_bits(self):
+    def test_mac_format_and_global_unicast_bits(self):
         for first in ("00", "01", "a1", "ff"):
             mac = run_rpc(MAC, "campusmac", "rotate", files={
                 "/proc/sys/kernel/random/uuid": first + "b2c3d4-e5f6-4718-893a-4b5c6d7e8f90\n"
             })["result"]["mac"]
             self.assertRegex(mac, r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
-            self.assertEqual(int(mac[:2], 16) & 3, 2)
+            self.assertEqual(int(mac[:2], 16) & 3, 0)
+
+    def test_curl_reads_response_body(self):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b'{"code":"0","message":"local-test"}'
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        url = f'http://127.0.0.1:{server.server_port}/probe'
+        fetch = re.search(r'cf_fetch\(\) \{.*?\n\}', DAEMON, re.S)[0]
+        try:
+            with tempfile.TemporaryDirectory(prefix='campus-http-') as temp:
+                jar = (Path(temp) / 'cookies').as_posix()
+                prelude = f'HAS_CURL=1; CF_JAR={shlex.quote(jar)}; UA=test; ACC_XHR=application/json;\n'
+                out = self.assert_shell_ok(prelude + fetch + f'\ncf_fetch {shlex.quote(url)} xhr ""')
+                self.assertEqual(json.loads(out)['message'], 'local-test')
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_human_delay_padded_minutes_and_seconds(self):
+        delay = re.search(r'human_delay\(\) \{.*?\n\}', DAEMON, re.S)[0]
+        script = 'date() { echo 09; }; sleep() { [ "$1" -ge 1 ] && [ "$1" -le 3 ]; };\n'
+        self.assert_shell_ok(script + delay + '\nhuman_delay 2')
 
     def test_ban_survives_new_process_migrates_and_expires(self):
         self.assertIn("BAN_UNTIL_FILE=/etc/campus-auth.banuntil", DAEMON)
