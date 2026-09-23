@@ -10,17 +10,9 @@
 # service bring-up, not in flash wear). Whatever the exact culprit turns out
 # to be, the router must NEVER lose its LAN over a filter rule again.
 #
-# Mechanism: run LATE in uci-defaults (number 89, after all other scripts
-# have written their files but the firewall has not necessarily started
-# yet - fw4 starts at S19, uci-defaults at S10, so at this point we cannot
-# test the real load. Instead we arm a boot-time check).
-#
-# The real check runs as an init script ordered BEFORE fw4 (START=18):
-#   - if /etc/nftables.d/*.nft exists, try `fw4 restart`
-#   - if it fails, move ALL drop-ins to /etc/nftables.d.disabled/ and
-#     `fw4 restart` again - this second attempt must succeed (stock fw4
-#     without drop-ins is the upstream default and always loads)
-#   - log loudly either way (logread -e campus-fw4guard)
+# Run the same dry-run once from uci-defaults (S10) and on subsequent
+# boots before fw4 (START=18, firewall START=19). If rendering or kernel
+# validation fails, quarantine the drop-ins before firewall startup.
 #
 # Result: worst case (a broken drop-in) the router comes up with the stock
 # firewall + NAT - internet works, LuCI works, only the campus anti-
@@ -29,9 +21,8 @@
 #
 # v2.9.1: the init script is armed too late for FIRST boot. uci-defaults
 # runs at S10; an enable at S10 creates the S18 rc.d symlink AFTER this
-# boot's start sequence was already expanded, so the guard only ever ran
-# from the SECOND boot on - leaving the riskiest boot (first flash, exactly
-# when v2.7.0 died) unguarded. Fix: run the same dry-run check INLINE here
+# boot's start sequence was already expanded, so the symlink only takes
+# effect from the SECOND boot on. Run the dry-run immediately here
 # at S10, before fw4's S19 loads the ruleset. Quarantine-at-S10 wins the
 # race cleanly: fw4 then starts with either the validated drop-ins or the
 # stock ruleset.
@@ -46,7 +37,9 @@ cat > /etc/init.d/campus-fw4guard <<'GUARDEOF'
 # the stock ruleset so the LAN always comes up.
 START=18
 
-start_service() {
+# This is a one-shot rc.common script, not a procd-managed process.
+start() {
+	local ruleset
 	# no drop-ins -> nothing to guard
 	ls /etc/nftables.d/*.nft >/dev/null 2>&1 || return 0
 
@@ -56,13 +49,16 @@ start_service() {
 	# running ruleset. -c still consults the kernel for some
 	# expressions, which is exactly what we want (the v2.7.0 failure
 	# mode was userspace-OK-kernel-NO).
-	if ! fw4 print 2>/dev/null | nft -c -f - >/dev/null 2>&1; then
+	# Check fw4 separately: a failed renderer can feed an empty, valid
+	# input to nft and make a plain pipeline falsely report success.
+	if ruleset=$(fw4 print 2>/dev/null) && [ -n "$ruleset" ] &&
+		printf '%s\n' "$ruleset" | nft -c -f - >/dev/null 2>&1; then
+		logger -t campus-fw4guard "fw4 ruleset dry-run OK"
+	else
 		logger -t campus-fw4guard "fw4 ruleset FAILED dry-run; quarantining /etc/nftables.d drop-ins"
 		mkdir -p /etc/nftables.d.disabled
 		mv /etc/nftables.d/*.nft /etc/nftables.d.disabled/ 2>/dev/null
 		logger -t campus-fw4guard "drop-ins moved to /etc/nftables.d.disabled - router runs stock firewall; check logread for the failing rule"
-	else
-		logger -t campus-fw4guard "fw4 ruleset dry-run OK"
 	fi
 }
 GUARDEOF
@@ -71,19 +67,8 @@ chmod +x /etc/init.d/campus-fw4guard
 # fw4's own init is START=19 (S19firewall). Our guard must run first.
 /etc/init.d/campus-fw4guard enable
 
-# v2.9.1: also run the check ONCE right here (S10, first boot). enable at
-# S10 arms S18 only for FUTURE boots; the first boot's fw4 (S19) would
-# otherwise load the drop-ins completely unguarded. `fw4 print` works with
-# fw4 not yet started (it renders config, it does not query the running
-# ruleset), so the same dry-run logic applies verbatim.
-if ls /etc/nftables.d/*.nft >/dev/null 2>&1; then
-	if fw4 print 2>/dev/null | nft -c -f - >/dev/null 2>&1; then
-		logger -t campus-fw4guard "first-boot inline dry-run OK (uci-defaults S10)"
-	else
-		logger -t campus-fw4guard "first-boot inline dry-run FAILED; quarantining drop-ins before fw4 starts"
-		mkdir -p /etc/nftables.d.disabled
-		mv /etc/nftables.d/*.nft /etc/nftables.d.disabled/ 2>/dev/null
-	fi
-fi
+# First boot's rc.d list has already been expanded: invoke the same
+# start() now rather than relying on the newly created S18 symlink.
+/etc/init.d/campus-fw4guard start
 
 exit 0

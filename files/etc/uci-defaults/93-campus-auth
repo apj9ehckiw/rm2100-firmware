@@ -89,24 +89,47 @@ STATUS_FILE=/tmp/campus-auth.status
 # respawn (or a reboot) walked straight back into quickauth during the ban -
 # and each attempt during a ban RE-MARKS the MAC (v2.8.0 note). Persist the
 # expiry epoch so any restarted daemon stays silent until it lapses.
-BAN_UNTIL_FILE=/tmp/campus-auth.banuntil
+# /etc is on the persistent overlay; /tmp is erased on router reboot.
+BAN_UNTIL_FILE=/etc/campus-auth.banuntil
+LEGACY_BAN_UNTIL_FILE=/tmp/campus-auth.banuntil
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
 log() { logger -t campus-auth "$1"; }
 set_status() { echo "$1" > "$STATUS_FILE"; }
+
+# Only write flash when a ban is received or migrated, never each cycle.
+# Rename on the same filesystem so readers cannot see a partial epoch.
+persist_ban() (
+	umask 077
+	tmp="${BAN_UNTIL_FILE}.$$"
+	if printf '%s\n' "$BAN_UNTIL" > "$tmp" && mv -f "$tmp" "$BAN_UNTIL_FILE"; then
+		rm -f "$LEGACY_BAN_UNTIL_FILE"
+	else
+		rm -f "$tmp"
+		log "failed to persist ban expiry; keeping in-memory ban"
+		return 1
+	fi
+)
+
+clear_ban() {
+	rm -f "$BAN_UNTIL_FILE" "$LEGACY_BAN_UNTIL_FILE"
+}
 
 # sleep with human-like jitter: a fixed 90s loop is a stopwatch signature.
 # v2.9: widened to ±35% (was ±20%) - with the steady-state probe traffic
 # removed, the sleep cadence itself is the last periodic signature left;
 # ±20% of 90s still clusters tightly around 90, ±35% spreads 58..122s.
 jittered_sleep() {
-	local base jitter s
+	local base jitter s second minute
 	base=${1:-90}
 	case "$base" in ''|*[!0-9]*) base=90 ;; esac
 	jitter=$(( base * 7 / 20 ))
 	[ "$jitter" -lt 1 ] && jitter=1
 	# busybox 无 $RANDOM：用 PID+秒/分的低位混合，凑一个 -jitter..+jitter 的散布
-	s=$(( ( $$ * 7 + $(date +%S) * 13 + $(date +%M) * 29 ) % ( jitter * 2 + 1 ) - jitter ))
+	second=$(date +%S); minute=$(date +%M)
+	# Strip the single date padding zero: ash treats 08/09 as invalid octal.
+	second=${second#0}; minute=${minute#0}
+	s=$(( ( $$ * 7 + second * 13 + minute * 29 ) % ( jitter * 2 + 1 ) - jitter ))
 	# NOTE: 不再把负 s 钳成 0（v2.7.0~v2.8.1 的老 bug：钳位后只剩单侧
 	# +0~+20% 抖动，基准值仍高度可预测）。下限由最后一行的 sleep 三元保护。
 	sleep $(( base + s > 5 ? base + s : 5 ))
@@ -409,12 +432,17 @@ ONLINE_STAMP=0
 # without this, procd respawn after a crash / `service campus-auth restart`
 # / reboot walks straight back into quickauth mid-ban and re-marks the MAC.
 BAN_UNTIL=0
-if [ -f "$BAN_UNTIL_FILE" ]; then
-	BAN_UNTIL=$(cat "$BAN_UNTIL_FILE" 2>/dev/null)
+ban_source=$BAN_UNTIL_FILE
+[ -f "$ban_source" ] || ban_source=$LEGACY_BAN_UNTIL_FILE
+if [ -f "$ban_source" ]; then
+	BAN_UNTIL=$(cat "$ban_source" 2>/dev/null)
 	case "$BAN_UNTIL" in ''|*[!0-9]*) BAN_UNTIL=0 ;; esac
 	if [ "$BAN_UNTIL" -gt 0 ] && [ "$(date +%s)" -ge "$BAN_UNTIL" ]; then
 		BAN_UNTIL=0
-		rm -f "$BAN_UNTIL_FILE"
+		clear_ban
+	fi
+	if [ "$BAN_UNTIL" -gt 0 ] && [ "$ban_source" = "$LEGACY_BAN_UNTIL_FILE" ]; then
+		persist_ban
 	fi
 	[ "$BAN_UNTIL" -gt 0 ] && log "resumed persisted ban (until $(date -d @${BAN_UNTIL} '+%H:%M:%S' 2>/dev/null || date '+%H:%M:%S'))"
 fi
@@ -458,7 +486,7 @@ while true; do
 	if [ "$BAN_UNTIL" -gt 0 ]; then
 		if [ "$(date +%s)" -ge "$BAN_UNTIL" ]; then
 			BAN_UNTIL=0
-			rm -f "$BAN_UNTIL_FILE"
+			clear_ban
 			set_status "ban-expired（代理行为封禁已到期，恢复正常认证流程） $(date '+%Y-%m-%d %H:%M:%S')"
 			log "ban expired; resuming normal auth flow"
 		else
@@ -647,7 +675,8 @@ while true; do
 		continue
 	fi
 
-	Q=$(echo "$REDIRECT" | sed 's/.*portal\..do?//')
+	Q=${REDIRECT#*\?}
+	Q=${Q%%\#*}
 	echo "$Q" > /tmp/campus-auth.params
 
 	JSON=$(portal_status "$Q")
@@ -693,7 +722,7 @@ while true; do
 			BAN_UNTIL=$(( $(date +%s) + BAN_SECONDS + 60 ))  # +60s margin
 			# persist: the AC ban is MAC-keyed and outlives the daemon -
 			# a crash/respawn/reboot must not walk back into quickauth
-			echo "$BAN_UNTIL" > "$BAN_UNTIL_FILE"
+			persist_ban
 			set_status "banned（触发代理行为检测：${MSG}；认证禁至 $(date -d @${BAN_UNTIL} '+%H:%M:%S' 2>/dev/null || date '+%H:%M:%S')，期间静默不再尝试，到期自动恢复） $(date '+%Y-%m-%d %H:%M:%S')"
 			log "auth banned by AC for ${BAN_MIN}min (proxy-behavior detection); going silent"
 			# sleep in slices so uci edits (disable/interval) still apply;
@@ -777,8 +806,13 @@ cat > /usr/share/rpcd/ucode/campusauth <<'UCEOF'
 import { readfile, popen } from 'fs';
 import { cursor } from 'uci';
 
-const q = "'";
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+
+// URL encoding does not quote a shell argument. Apply this to every
+// dynamic argument passed to popen, including server-supplied fields.
+function shellquote(s) {
+	return "'" + replace(s ?? '', /'/g, "'\\''") + "'";
+}
 
 function enc(s) {
 	// percent-encode query-string-hostile chars (covers typical passwords)
@@ -789,7 +823,9 @@ function fetch(url) {
 	// uclient-fetch has NO --header option (v2.7.0-2.7.2 bug: passing it
 	// made every fetch fail with a usage error, so the LuCI login button
 	// and the daemon both silently broke). UA-only request.
-	let p = popen('uclient-fetch -q -T 8 --user-agent ' + q + UA + q + ' -O - ' + q + url + q + ' 2>/dev/null');
+	let p = popen('uclient-fetch -q -T 8 --user-agent ' + shellquote(UA) + ' -O - ' + shellquote(url) + ' 2>/dev/null');
+	if (!p)
+		return '';
 	let out = p.read('all');
 	p.close();
 	return out ?? '';
@@ -821,7 +857,7 @@ return {
 				let running = false;
 				let pid = trim(readfile('/var/run/campus-auth.pid') ?? '');
 				if (pid) {
-					let p = popen('kill -0 ' + pid + ' 2>/dev/null && echo up');
+					let p = popen('kill -0 ' + shellquote(pid) + ' 2>/dev/null && echo up');
 					if (p) {
 						running = trim(p.read('all') ?? '') == 'up';
 						p.close();
@@ -869,7 +905,10 @@ return {
 				// int('') returns null and null < N is numerically TRUE in
 				// ucode, so both sides must be null-checked or a popen
 				// failure would wrongly block login forever.
-				let ban_until = trim(readfile('/tmp/campus-auth.banuntil') ?? '');
+				// Legacy fallback protects a live daemon until it restarts
+				// and migrates its old /tmp record onto the overlay.
+				let ban_until = trim(readfile('/etc/campus-auth.banuntil') ??
+					readfile('/tmp/campus-auth.banuntil') ?? '');
 				if (ban_until && match(ban_until, /^[0-9]+$/)) {
 					let p = popen('echo "$(date +%s) $(date -d @' + ban_until + ' "+%H:%M:%S" 2>/dev/null)"');
 					let out = trim(p ? (p.read('all') ?? '') : '');
@@ -964,15 +1003,16 @@ return {
 				// which is ABSENT from the logout.html URL - i.e. an EMPTY
 				// string. v2.7.3 and earlier hard-coded '0' here and the AC
 				// answered code=1 (下线失败); mirror the stock client exactly.
-				let cmd = 'uclient-fetch -q -T 8 --user-agent ' + q + UA + q +
-					' --post-data=' + q +
-					'wlanacip=' + (p.wlanacip ?? '10.1.110.3') +
+				let data = 'wlanacip=' + (p.wlanacip ?? '10.1.110.3') +
 					'&wlanuserip=' + (p.wlanuserip ?? '') +
 					'&wlanacname=' + (p.wlanacname ?? '') +
-					'&version=0&portaltype=&userid=' + userid +
-					'&mac=' + (p.mac ?? '') + '&groupId=' + (args?.groupId ?? '2') +
-					q + ' -O - ' + q + url + q + ' 2>/dev/null';
+					'&version=0&portaltype=&userid=' + enc(userid) +
+					'&mac=' + (p.mac ?? '') + '&groupId=' + enc(args?.groupId ?? '2');
+				let cmd = 'uclient-fetch -q -T 8 --user-agent ' + shellquote(UA) +
+					' --post-data=' + shellquote(data) + ' -O - ' + shellquote(url) + ' 2>/dev/null';
 				let exec = popen(cmd);
+				if (!exec)
+					return { code: null, error: '无法启动下线请求' };
 				let out = exec.read('all');
 				exec.close();
 				return { code: jget(out, 'code'), message: jget(out, 'message') };

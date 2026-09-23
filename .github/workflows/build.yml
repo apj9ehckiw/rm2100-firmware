@@ -36,7 +36,10 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl xz-utils zstd ca-certificates
+          sudo apt-get install -y curl xz-utils zstd ca-certificates busybox python3
+
+      - name: Test campus overlay regressions
+        run: python3 tests/test_review_fixes.py
 
       - name: Download OpenWrt ImageBuilder
         run: |

@@ -111,7 +111,9 @@ return {
 				// (ucode builtin is hexdec - hex2dec does not exist)
 				let b1 = (hexdec(substr(hex, 0, 2)) | 0x02) & 0xFE;
 
-				return { mac: sprintf('%02x%s', b1, substr(hex, 2, 10)) };
+				return { mac: sprintf('%02x:%s:%s:%s:%s:%s', b1,
+					substr(hex, 2, 2), substr(hex, 4, 2), substr(hex, 6, 2),
+					substr(hex, 8, 2), substr(hex, 10, 2)) };
 			}
 		}
 	}
