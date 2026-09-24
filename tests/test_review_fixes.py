@@ -66,6 +66,7 @@ const int = (s, base = 10) => typeof s === 'number' ? Math.trunc(s) : parseInt(s
 const regexp = s => new RegExp(s);
 const match = (s, r) => r.global ? Array.from(String(s).matchAll(r)) : String(s).match(r);
 const push = (a, ...v) => a.push(...v);
+const filter = (a, fn) => a.filter(fn);
 const replace = (s, p, r) => typeof p === 'string'
     ? String(s).replaceAll(p, r) : String(s).replace(p, r);
 const sprintf = (fmt, ...args) => {
@@ -351,8 +352,10 @@ logger() {{ :; }}
                  "/tmp/campus-auth.status": "banned（手动认证收到封禁）"}
         blocked = run_rpc(RPC, "campusauth", "login", config=config, files=files, now=1000)
         self.assertIn("封禁", blocked["result"]["error"])
-        status = run_rpc(RPC, "campusauth", "status", files=files, now=2860)
+        status = run_rpc(RPC, "campusauth", "status", files=files, now=2860,
+                         config={"day_1": "1", "day_2": "0", "day_0": "1"})
         self.assertTrue(status["result"]["status"].startswith("ban-expired"))
+        self.assertEqual(status["result"]["days"], ["1", "0"])
         expired = run_rpc(RPC, "campusauth", "login", config=config, files=files, now=2860)
         self.assertEqual(expired["result"]["code"], "0")
         command = next(c for c in result["commands"] if c.startswith("umask 077;"))

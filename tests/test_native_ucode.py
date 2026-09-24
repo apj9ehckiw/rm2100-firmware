@@ -22,7 +22,7 @@ function readfile(path) {
 }
 function cursor() {
     return { get: function(c, s, o) {
-        return { username: "user'one", password: "O'br'ien&+% ?", portal_ip: '10.1.110.2' }[o];
+        return { username: "user'one", password: "O'br'ien&+% ?", portal_ip: '10.1.110.2', day_1: '1' }[o];
     } };
 }
 function popen(cmd) {
@@ -67,7 +67,9 @@ commands = [];
 assert(plugin.campusauth.login.call({}, {}).error != null, 'repeat login not blocked');
 assert(length(filter(commands, cmd => substr(cmd, 0, 5) == 'curl ')) == 0, 'blocked login sent requests');
 now = 2860;
-assert(index(plugin.campusauth.status.call({}, {}).status, 'ban-expired') == 0, 'expired status stale');
+let status = plugin.campusauth.status.call({}, {});
+assert(index(status.status, 'ban-expired') == 0, 'expired status stale');
+assert(length(status.days) == 1 && status.days[0] == '1', 'status weekday filtering failed');
 auth_reply = '{"code":"0","message":null}';
 assert(plugin.campusauth.login.call({}, {}).code == '0', 'login still blocked after deadline');
 ''',

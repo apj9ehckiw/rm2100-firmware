@@ -1235,7 +1235,7 @@ return {
 					interval: uci.get('campusauth', 'login', 'interval') || '90',
 					active_start: uci.get('campusauth', 'login', 'active_start') || '',
 					active_end: uci.get('campusauth', 'login', 'active_end') || '',
-					days: ['1','2','3','4','5','6','0'].filter(d => uci.get('campusauth', 'login', 'day_' + d) == '1'),
+					days: filter(['1','2','3','4','5','6','0'], d => uci.get('campusauth', 'login', 'day_' + d) == '1'),
 					portal_ip: uci.get('campusauth', 'portal', 'portal_ip') || '10.1.110.2'
 				};
 			}
