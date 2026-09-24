@@ -78,13 +78,16 @@ const popen = cmd => {
     if (opts.popenFails) return null;
     let out = '';
     if (cmd === 'command -v curl 2>/dev/null') out = opts.hasCurl === false ? '' : '/usr/bin/curl';
+    else if (cmd === 'date +%s') out = `${opts.now || 1000}`;
+    else if (cmd.startsWith('date -d @')) out = '2026-09-24 12:00:00';
+    else if (cmd.startsWith('umask 077;')) out = (opts.writeFailures || []).some(p => cmd.includes(p)) ? '' : 'saved';
     else if (cmd.startsWith('echo ')) out = `${opts.now || 1000} 00:33:20`;
     else if (cmd.includes('PortalJsonAction.do')) out = JSON.stringify({
         timestamp: '1000', uuid: 'test-uuid', serverip: '10.1.110.3',
         wlanuserip: '10.9.9.9', wlanacname: opts.acname || 'AC1',
         mac: 'aa:bb:cc:dd:ee:ff', vlan: '9'
     });
-    else if (cmd.includes('quickauth')) out = '{"code":"0","message":"ok"}';
+    else if (cmd.includes('quickauth')) out = JSON.stringify(opts.authReply || {code: '0', message: 'ok'});
     else if (cmd.includes('/portal.do?')) out = '<link href="/style.css"><script src="/portal.js"></script>';
     else if (cmd.includes('3.3.3.3')) out = '<script>location="http://10.1.110.2/portal.do?wlanuserip=10.9.9.9&wlanacname=AC1&mac=aa:bb:cc:dd:ee:ff&vlan=9";</script>';
     return {read: () => out, close: () => {}};
@@ -306,6 +309,84 @@ logger() {{ :; }}
                 self.assertEqual(len(blocked["commands"]), 1)  # date only, no fetch.
                 expired = run_rpc(RPC, "campusauth", "login", config=config, files={path: "2000"}, now=2000)
                 self.assertEqual(expired["result"]["code"], "0")
+
+    def test_manual_ban_saved_and_next_process_blocked(self):
+        config = {"username": "PRIVATE_USER", "password": "PRIVATE_PASSWORD"}
+        for message, minutes in (("发现您当前网络环境存在代理行为,禁用认证30分钟", 30),
+                                 ("禁止认证 5 分钟", 5), ("代理行为", 30)):
+            with self.subTest(message=message), tempfile.TemporaryDirectory(prefix="manual-ban-") as temp:
+                result = run_rpc(RPC, "campusauth", "login", config=config, now=1000,
+                                 authReply={"code": "-1", "message": message})
+                self.assertEqual(result["result"]["message"], message)
+                writes = [c for c in result["commands"] if c.startswith("umask 077;")]
+                self.assertEqual(len(writes), 2)
+                ban = Path(temp) / "ban"
+                status = Path(temp) / "status"
+                for command in writes:
+                    self.assertEqual(self.assert_shell_ok(command.replace(
+                        "/etc/campus-auth.banuntil", ban.as_posix()).replace(
+                        "/tmp/campus-auth.status", status.as_posix())), "saved")
+                until = 1000 + minutes * 60 + 60
+                self.assertEqual(ban.read_text().strip(), str(until))
+                self.assertTrue(status.read_text(encoding="utf-8").startswith("banned"))
+                self.assertEqual(list(Path(temp).glob("*.??????")), [])
+                # A fresh RPC process, with no daemon, must honor the saved ban.
+                blocked = run_rpc(RPC, "campusauth", "login", config=config, now=until - 1,
+                                  files={"/etc/campus-auth.banuntil": ban.read_text()})
+                self.assertIn("封禁", blocked["result"]["error"])
+                self.assertFalse(any("quickauth" in c or c.startswith("curl ") for c in blocked["commands"]))
+                logs = "\n".join(c for c in result["commands"] if c.startswith("logger "))
+                self.assertIn("duration_minutes=" + str(minutes), logs)
+                self.assertNotIn(config["username"], logs)
+                self.assertNotIn(config["password"], logs)
+                self.assertNotIn(message, logs)
+
+    def test_manual_ban_fallback_expiry_and_failed_atomic_write(self):
+        config = {"username": "test", "password": "test"}
+        result = run_rpc(RPC, "campusauth", "login", config=config,
+                         authReply={"code": "-1", "message": "代理行为"},
+                         writeFailures=["/etc/campus-auth.banuntil"])
+        self.assertTrue(any("cooldown=temporary" in c for c in result["commands"]))
+        files = {"/etc/campus-auth.banuntil": "500", "/tmp/campus-auth.banuntil": "2860",
+                 "/tmp/campus-auth.status": "banned（手动认证收到封禁）"}
+        blocked = run_rpc(RPC, "campusauth", "login", config=config, files=files, now=1000)
+        self.assertIn("封禁", blocked["result"]["error"])
+        status = run_rpc(RPC, "campusauth", "status", files=files, now=2860)
+        self.assertTrue(status["result"]["status"].startswith("ban-expired"))
+        expired = run_rpc(RPC, "campusauth", "login", config=config, files=files, now=2860)
+        self.assertEqual(expired["result"]["code"], "0")
+        command = next(c for c in result["commands"] if c.startswith("umask 077;"))
+        with tempfile.TemporaryDirectory(prefix="manual-atomic-") as temp:
+            ban = Path(temp) / "ban"
+            ban.write_text("2000\n")
+            command = command.replace("/etc/campus-auth.banuntil", ban.as_posix())
+            self.assertEqual(self.assert_shell_ok("mv() { return 1; };\n" + command), "")
+            self.assertEqual(ban.read_text(), "2000\n")
+            self.assertEqual(list(Path(temp).iterdir()), [ban])
+
+    def test_manual_results_do_not_log_portal_text_or_write_success_to_flash(self):
+        config = {"username": "PRIVATE_USER", "password": "PRIVATE_PASSWORD"}
+        for reply in ({"code": "0", "message": "ok"},
+                      {"code": "-1", "message": "密码错误 PRIVATE_PASSWORD"},
+                      {"code": "bad'; echo INJECTED; #", "message": "代理行为 $(touch INJECTED)"}):
+            result = run_rpc(RPC, "campusauth", "login", config=config, authReply=reply)
+            logs = "\n".join(c for c in result["commands"] if c.startswith("logger "))
+            self.assertNotIn("PRIVATE_", logs)
+            self.assertNotIn("INJECTED", logs)
+            if "代理行为" not in reply["message"]:
+                self.assertFalse(any(c.startswith("umask 077;") for c in result["commands"]))
+
+    def test_running_daemon_observes_new_manual_ban(self):
+        refresh = re.search(r"refresh_ban\(\) \{.*?\n\}", DAEMON, re.S)[0]
+        with tempfile.TemporaryDirectory(prefix="manual-daemon-") as temp:
+            ban = Path(temp) / "ban"
+            fallback = Path(temp) / "fallback"
+            ban.write_text("1500\n", newline="\n")
+            fallback.write_text("2860\n", newline="\n")
+            script = (f"BAN_UNTIL_FILE={shlex.quote(ban.as_posix())}; "
+                      f"LEGACY_BAN_UNTIL_FILE={shlex.quote(fallback.as_posix())}; BAN_UNTIL=0;\n"
+                      + refresh + '\nrefresh_ban; printf "%s" "$BAN_UNTIL"')
+            self.assertEqual(self.assert_shell_ok(script), "2860")
 
 
 if __name__ == "__main__":

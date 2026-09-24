@@ -12,10 +12,13 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 stub = r'''
 let commands = [];
+let files = {};
+let auth_reply = '{"code":"0","message":null}';
+let now = 1000;
 function readfile(path) {
     if (path == '/proc/sys/kernel/random/uuid')
         return 'a1b2c3d4-e5f6-4718-893a-4b5c6d7e8f90';
-    return null;
+    return files[path] ?? null;
 }
 function cursor() {
     return { get: function(c, s, o) {
@@ -26,9 +29,13 @@ function popen(cmd) {
     push(commands, cmd);
     let out = '';
     if (cmd == 'command -v curl 2>/dev/null') out = '/usr/bin/curl';
+    else if (cmd == 'date +%s') out = '' + now;
+    else if (substr(cmd, 0, 5) == 'echo ') out = now + ' 00:47:40';
+    else if (substr(cmd, 0, 8) == 'date -d ') out = '2026-09-24 12:00:00';
+    else if (substr(cmd, 0, 10) == 'umask 077;') out = 'saved';
     else if (match(cmd, /PortalJsonAction[.]do/))
         out = '{"timestamp":"1000","uuid":"u1","serverip":"10.1.110.3","wlanuserip":"10.9.9.9","wlanacname":"AC1","mac":"aa:bb:cc:dd:ee:ff","vlan":"9"}';
-    else if (match(cmd, /quickauth/)) out = '{"code":"0","message":null}';
+    else if (match(cmd, /quickauth/)) out = auth_reply;
     else if (match(cmd, /portal[.]do[?]/)) out = '<link href="/style.css"><script src="/portal.js"></script>';
     else if (match(cmd, /3[.]3[.]3[.]3/))
         out = '<script>location="http://10.1.110.2/portal.do?wlanuserip=10.9.9.9&wlanacname=AC1&mac=aa:bb:cc:dd:ee:ff&vlan=9";</script>';
@@ -45,6 +52,24 @@ assert(length(requests) == 6, 'portal assets were not loaded');
 assert(index(requests[length(requests) - 1], 'passwd=O%27br%27ien%26%2B%25%20%3F') >= 0, 'password encoding');
 let logout = plugin.campusauth.logout.call({}, {});
 assert(logout.code == '0', 'native logout failed');
+commands = [];
+auth_reply = '{"code":"-1","message":"发现您当前网络环境存在代理行为,禁用认证30分钟"}';
+let banned = plugin.campusauth.login.call({}, {});
+assert(banned.code == '-1', 'ban reply lost');
+assert(length(filter(commands, cmd => index(cmd, "printf '%s\\n' '2860'") >= 0)) == 1,
+       'ban deadline not persisted with 60 second margin');
+assert(length(filter(commands, cmd => index(cmd, 'cooldown=persistent') >= 0)) == 1,
+       'manual ban log missing');
+files['/etc/campus-auth.banuntil'] = '500';
+files['/tmp/campus-auth.banuntil'] = '2860';
+files['/tmp/campus-auth.status'] = 'banned（手动认证收到封禁）';
+commands = [];
+assert(plugin.campusauth.login.call({}, {}).error != null, 'repeat login not blocked');
+assert(length(filter(commands, cmd => substr(cmd, 0, 5) == 'curl ')) == 0, 'blocked login sent requests');
+now = 2860;
+assert(index(plugin.campusauth.status.call({}, {}).status, 'ban-expired') == 0, 'expired status stale');
+auth_reply = '{"code":"0","message":null}';
+assert(plugin.campusauth.login.call({}, {}).code == '0', 'login still blocked after deadline');
 ''',
     '95-campus-mac-luci': r'''
 let mac = plugin.campusmac.rotate.call({}, {}).mac;

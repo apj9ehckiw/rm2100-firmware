@@ -133,6 +133,22 @@ clear_ban() {
 	rm -f "$BAN_UNTIL_FILE" "$LEGACY_BAN_UNTIL_FILE"
 }
 
+# A manual RPC can receive a ban while the daemon is already running.
+# Read both records, keeping the later deadline (including a /tmp fallback).
+refresh_ban() {
+	local candidate path
+	for path in "$BAN_UNTIL_FILE" "$LEGACY_BAN_UNTIL_FILE"; do
+		candidate=$(cat "$path" 2>/dev/null)
+		case "$candidate" in ''|*[!0-9]*) continue ;; esac
+		[ "${#candidate}" -le 10 ] || continue
+		if [ "$candidate" -gt "$BAN_UNTIL" ]; then
+			BAN_UNTIL=$candidate
+			ban_source=$path
+		fi
+	done
+	return 0
+}
+
 # $1 秒 ±50% 的「人类间隔」（资产加载/输入模拟用）。busybox 无 $RANDOM，
 # 与 jittered_sleep 同款 PID+时分秒混合源。0.5s 粒度对 DPI 足够（看的是
 # 会话结构不是毫秒时序）；busybox sleep 不支持小数时整数兜底。
@@ -591,10 +607,8 @@ ONLINE_STAMP=0
 # / reboot walks straight back into quickauth mid-ban and re-marks the MAC.
 BAN_UNTIL=0
 ban_source=$BAN_UNTIL_FILE
-[ -f "$ban_source" ] || ban_source=$LEGACY_BAN_UNTIL_FILE
+refresh_ban
 if [ -f "$ban_source" ]; then
-	BAN_UNTIL=$(cat "$ban_source" 2>/dev/null)
-	case "$BAN_UNTIL" in ''|*[!0-9]*) BAN_UNTIL=0 ;; esac
 	if [ "$BAN_UNTIL" -gt 0 ] && [ "$(date +%s)" -ge "$BAN_UNTIL" ]; then
 		BAN_UNTIL=0
 		clear_ban
@@ -641,6 +655,7 @@ while true; do
 	# no hijack probes, no generate_204, no quickauth. Probing looks like
 	# ordinary browser traffic and does not lift the ban; authenticating
 	# does and re-marks the MAC.
+	refresh_ban
 	if [ "$BAN_UNTIL" -gt 0 ]; then
 		if [ "$(date +%s)" -ge "$BAN_UNTIL" ]; then
 			BAN_UNTIL=0
@@ -874,6 +889,8 @@ while true; do
 		AUTH_URL="http://$PORTAL_IP/quickauth.do?userid=$USERID_ENC&passwd=$PASSWD_ENC&wlanuserip=$USERIP&wlanacname=$ACNAME&wlanacIp=$ACIP&ssid=&vlan=$VLAN&mac=$MAC_ENC&version=0&portalpageid=1&timestamp=$TIMESTAMP&uuid=$UUID&portaltype=0&hostname=&bindCtrlId="
 		# 模拟人填表→点登录的间隔（HAR：页面打开到 quickauth 相隔 10s）
 		pre_auth_pause
+		refresh_ban
+		[ "$BAN_UNTIL" -gt "$(date +%s)" ] && continue
 		# XHR 形态：quickauth 是页面里 async:false 的 jQuery ajax GET，
 		# 带 Accept: application/json + X-Requested-With + Referer + ABMS cookie
 		RESP=$(fetch "$AUTH_URL" xhr "$REDIRECT")
@@ -1045,6 +1062,54 @@ function run(cmd) {
 	return out ?? '';
 }
 
+// Atomic private writes: a failed flash write must not truncate an existing
+// cooldown. Only fixed local messages and numeric codes go to status/syslog;
+// never log credentials, request URLs, or the portal's untrusted message.
+function write_private(path, value) {
+	return trim(run('umask 077; tmp=$(mktemp ' + shq(path + '.XXXXXX') + ') || exit 1; ' +
+		'if printf \'%s\\n\' ' + shq(value) + ' > "$tmp" && mv -f "$tmp" ' + shq(path) +
+		'; then printf saved; else rm -f "$tmp"; fi') ?? '') == 'saved';
+}
+
+function record_manual_result(code, message) {
+	let safe_code = match(code ?? '', /^-?[0-9]{1,8}$/) ? code : 'unknown';
+	if (!match(message ?? '', /禁用|禁止|代理行为|封禁/)) {
+		run('logger -t campus-auth ' + shq('manual login result code=' + safe_code));
+		return;
+	}
+	let duration = match(message, /([0-9]{1,4}) *分钟/);
+	let minutes = duration ? int(duration[1]) : 30;
+	let now = trim(run('date +%s') ?? '');
+	if (!match(now, /^[0-9]{1,10}$/)) {
+		run('logger -t campus-auth ' + shq('manual login banned; unable to read clock, cooldown not saved'));
+		return;
+	}
+	let until = int(now) + minutes * 60 + 60;
+	let saved = write_private('/etc/campus-auth.banuntil', '' + until);
+	// Keep a volatile fallback if flash is unavailable. Readers use the later
+	// of both records, so an older flash record cannot hide the fallback.
+	let temporary = false;
+	if (!saved)
+		temporary = write_private('/tmp/campus-auth.banuntil', '' + until);
+	let deadline = trim(run('date -d @' + until + ' "+%Y-%m-%d %H:%M:%S"') ?? '');
+	write_private('/tmp/campus-auth.status',
+		'banned（手动认证收到封禁；本地冷却至 ' + (deadline || (minutes + ' 分钟后，另加 60 秒余量')) +
+		(saved || temporary ? '，请等待到期）' : '；冷却记录保存失败，请勿重复认证）'));
+	run('logger -t campus-auth ' + shq('manual login banned code=' + safe_code +
+		' duration_minutes=' + minutes + ' until=' + until +
+		' cooldown=' + (saved ? 'persistent' : temporary ? 'temporary' : 'SAVE_FAILED')));
+}
+
+function recorded_ban_until() {
+	let until = 0;
+	for (let path in ['/etc/campus-auth.banuntil', '/tmp/campus-auth.banuntil']) {
+		let value = trim(readfile(path) ?? '');
+		if (match(value, /^[0-9]{1,10}$/) && int(value) > until)
+			until = int(value);
+	}
+	return until;
+}
+
 // v2.10.0: 浏览器头集 fetch（curl 主 / uclient-fetch 回退）。
 // 镜像内 curl 由 build.yml PACKAGES 保证存在；回退分支保留是因为
 // sysupgrade 之外手工 opkg remove 之类的边缘情况不该把手动登录整个打挂。
@@ -1140,6 +1205,12 @@ return {
 			call: function(request, args) {
 				let st = trim(readfile('/tmp/campus-auth.status') ?? '');
 				let uci = cursor();
+				let until = recorded_ban_until();
+				if (until > 0 && match(st, /^banned/)) {
+					let now = trim(run('date +%s') ?? '');
+					if (match(now, /^[0-9]{1,10}$/) && int(now) >= until)
+						st = 'ban-expired（本地冷却已到期；尚未确认认证服务器是否解除封禁）';
+				}
 
 				// is the daemon process actually up? procd writes the
 				// instance pidfile; a shell script's comm is "sh", so
@@ -1193,17 +1264,16 @@ return {
 				// int('') returns null and null < N is numerically TRUE in
 				// ucode, so both sides must be null-checked or a popen
 				// failure would wrongly block login forever.
-				let ban_until = trim(readfile('/etc/campus-auth.banuntil') ??
-					readfile('/tmp/campus-auth.banuntil') ?? '');
-				if (ban_until && match(ban_until, /^[0-9]+$/)) {
-					// ban_until 已被上面的 ^[0-9]+$ 卡死，插值安全；run() 保证
+				let ban_until = recorded_ban_until();
+				if (ban_until > 0) {
+					// ban_until is a validated numeric epoch; run() guarantees
 					// popen 失败时返回空串而不是抛异常。
 					let out = trim(run('echo "$(date +%s) $(date -d @' + ban_until + ' "+%H:%M:%S" 2>/dev/null)"') ?? '');
 					let parts = split(out, ' ');
 					let now_s = int(parts[0]);
 					let until_s = int(ban_until);
 					if (now_s != null && until_s != null && now_s < until_s)
-						return { code: null, error: '代理行为封禁中（至 ' + (parts[1] ?? '?') + '），请勿重复尝试认证，到期后守护进程自动恢复' };
+						return { code: null, error: '代理行为封禁中（至 ' + (parts[1] ?? '?') + '），请等待冷却到期；启用自动认证时由后台重试，否则需手动认证' };
 				}
 
 				// probe hijack targets for session params (same order and
@@ -1269,6 +1339,7 @@ return {
 				let resp = cf_fetch(auth_url, 'xhr', redirect[0]);
 				let code = jget(resp, 'code');
 				let message = jget(resp, 'message');
+				record_manual_result(code, message);
 
 				return { code: code, message: message };
 			}
@@ -1515,7 +1586,7 @@ return view.extend({
 					(st.running === true) ? _('运行中') : _('未运行'),
 					esc(stat.detail)) +
 			(stat.isBanned
-				? _('<br /><b style="color:#e03131">注意：触发代理行为检测已被封禁。封禁期间同 MAC 重复尝试认证会加重标记，守护进程已静默等待，请勿手动点击「登录」。到期后自动恢复。</b>')
+				? _('<br /><b style="color:#e03131">认证服务器返回了封禁提示。请等待冷却到期；启用自动认证时由后台重试，否则需手动认证。</b>')
 				: ''));
 
 		s = m.section(form.NamedSection, 'login', 'login', _('认证设置'));
