@@ -116,7 +116,7 @@ return {
 				// 改为：从一个常见 Windows 笔电/台机网卡厂商 OUI 里随机挑一个
 				// 作前 3 字节，后 3 字节随机；首字节清掉 LAA(bit1) 与组播(bit0)
 				// → 全球单播地址，看起来就是一台普通 PC。
-				// (ucode builtin is hexdec - hex2dec does not exist)
+				// int(value, 16) parses a number; hexdec() returns binary bytes.
 				// 注意：全部选全球单播 OUI（首字节 bit1=0）。QEMU 的
 				// 52:54:00 本身是 LAA，不能用（清了 LAA 位就变成不存在
 				// 的厂商前缀 50:54:00）。
@@ -133,9 +133,9 @@ return {
 					'b8ac6f'  // Dell
 				];
 				// 用 hex 尾部做 OUI 选择的熵源（避免再读一次随机）
-				let oui = OUIS[ hexdec(substr(hex, 10, 2)) % length(OUIS) ];
+				let oui = OUIS[ int(substr(hex, 10, 2), 16) % length(OUIS) ];
 				// 首字节清 LAA(bit1)+组播(bit0) 位 → 全球单播
-				let b1 = hexdec(substr(oui, 0, 2)) & 0xFC;
+				let b1 = int(substr(oui, 0, 2), 16) & 0xFC;
 				// v2.10.1 修复：返回标准 xx:xx:xx:xx:xx:xx 冒号分隔格式。
 				// 旧版 sprintf('%02x%s%s', b1, oui[2:6], hex[0:6]) 拼出的是
 				// 12 位连续十六进制（如 "001b21a1b2c3"，无冒号），与页面

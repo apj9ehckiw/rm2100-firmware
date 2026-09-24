@@ -49,7 +49,8 @@ assert(logout.code == '0', 'native logout failed');
     '95-campus-mac-luci': r'''
 let mac = plugin.campusmac.rotate.call({}, {}).mac;
 assert(match(mac, /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/), 'invalid MAC format');
-assert((hexdec(substr(mac, 0, 2)) & 3) == 0, 'MAC must remain globally administered unicast');
+assert((int(substr(mac, 0, 2), 16) & 3) == 0, 'MAC must remain globally administered unicast');
+assert(mac == '3c:fd:fe:a1:b2:c3', 'wrong OUI selection or hex conversion');
 ''',
 }
 
