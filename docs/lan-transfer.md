@@ -1,0 +1,89 @@
+# 内网文件互传「邻传」
+
+连在同一台路由器上的手机、电脑，用浏览器打开 `http://路由器LAN地址:8080/`（默认 `http://192.168.1.1:8080/`）就能互相看到，直接发送文件和文字。不用安装应用，不用登录路由器后台，也不经过外网。LuCI 里「服务 → 内网文件互传」可以开关功能、改端口，也有打开页面的按钮。
+
+## 怎么用
+
+1. 两台设备都用浏览器打开上面的地址。电脑上可以点右上角「邀请设备」，手机扫二维码打开。
+2. 几秒内，对方会出现在「附近的设备」里，名字是随机的（如「青色海豚」），可以点「改名」。
+3. 点对方卡片上的「发文件」选择文件（可多选），或者直接把文件拖到对方卡片上。点「发文字」可以发链接、验证码这类短文字。
+4. 对方点「接收」后开始传输，两边都能看到进度、速度和剩余时间，任何一方都可以随时取消。
+5. 收到的文件点「保存」存到本机；多个文件可以「全部保存」，也可以「打包 ZIP」一次下载。电脑上默认收完自动保存，iPhone/iPad 默认手动保存（在「本机」卡片里切换）。
+
+传输期间两边页面都要开着。关掉或刷新页面后，本机会从其他设备的列表里消失，没收完的文件会被丢弃。
+
+## 工作原理
+
+- **设备发现与信令**：页面每 2 秒（后台标签页 8 秒）向路由器报一次到，路由器返回同一内网里其他打开着页面的设备，并转交设备之间的连接协商消息。这些信息只放在路由器内存盘 `/tmp/lan-transfer`，35 秒没有报到就自动清掉，重启全部消失，不写闪存。
+- **直连传输**：优先用 WebRTC DataChannel 在两台设备之间直接传（DTLS 加密），文件不经过路由器的 CPU 处理。路由器上跑着一个只监听 LAN 口的 STUN 应答器（UDP 3478），让浏览器拿到自己真实的内网地址：浏览器默认把本机地址隐藏成随机的 `xxx.local` 名字，部分安卓手机和开着防火墙的 Windows 解析不了对方的名字，没有这一步就会连不上。
+- **中转兜底**：浏览器不支持 WebRTC（例如部分 App 内置浏览器），或 9 秒内连不通（例如开启了 AP 隔离），就自动改走路由器中转：发送方按 1 MiB 分块上传，接收方取走一块路由器就删一块。每个传输最多暂存 4 块，所有中转合计最多占 12 MiB 内存，最多同时 4 个中转。一台设备直连失败后，一分钟内再发给它会直接走中转，不再重复等待。卡片上会标明「直连」或「经路由器中转」。
+- **完整性**：每个文件按 CRC32 和字节数校验，不一致就丢弃，不会出现可以保存的残缺文件。CRC32 只用来发现传输错误，不是身份认证或加密签名。
+
+## 限制
+
+- 接收的文件在保存前暂存在浏览器里：电脑单次最多接收 2 GiB，安卓手机 1 GiB，iPhone/iPad 512 MiB（尚未清除的已收文件也计入）。发送前会先按对方的上限检查。一次最多选 300 个文件。更大的文件请先分卷压缩。
+- 不支持断点续传、后台接收和离线暂存，暂不支持直接发送文件夹（请先压缩）。
+- 在微信、QQ 等 App 内打开时，页面会提示改用系统浏览器，因为 App 内置浏览器常常不允许保存文件。
+- 请使用较新的 Chrome、Edge、Firefox、Safari 或各家手机自带浏览器。自动化测试覆盖 Chromium，其他浏览器尚未实测。
+- 只提供当前 LAN 的 IPv4 入口，没有公网中继。访客网络之间无法互传。
+
+## 安全
+
+- 页面由路由器上一个独立的 uhttpd 提供，只绑定 `network.lan` 的 IPv4 地址，不改 LuCI 的 uhttpd，不加防火墙规则：OpenWrt 默认允许 LAN 访问路由器，WAN 侧照旧拒绝。
+- 后端只接受同源 POST：必须带 `Content-Type`，`Origin` 必须和 `Host` 完全一致，且 `Host` 只能是路由器 LAN 地址，或 `openwrt.lan` 这类本地名字（这类名字由 dnsmasq 本地解析，外部无法用 DNS 重绑定冒充）。每个设备的会话密钥是 128 位随机数，中转分块只有该传输的双方能读写。
+- 同一内网里任何打开页面的人都能看到你的设备名并向你发起传输，但每次都要你点「接收」才会开始。不想被看到时关掉页面即可，也可以在 LuCI 里关闭这个功能。
+- 限流：同一 IP 最多 8 个页面，全局最多 48 个；每台设备待收消息最多 48 条（192 KB），单条最多 64 KB，文字最多 1 万字。
+- 页面是内网明文 HTTP：直连数据由 WebRTC 加密，经路由器中转的数据和设备名、文字消息在内网里是明文，请只在信任的网络里使用。
+
+## 安装
+
+**固件**：v2.11.0 起的 campus-fix 固件自带此功能，首刷后自动启用。构建时显式加入 `uhttpd ucode ucode-mod-fs ucode-mod-socket`，所以 `include_luci=false` 的纯命令行固件也能用，只是没有 LuCI 设置页。
+
+**已有的 OpenWrt 24.10 路由器**：可以装增量包，不用刷机。在仓库里运行：
+
+```sh
+python tools/package_lan_transfer.py
+```
+
+把生成的 `firmware-out/lan-transfer-addon.tar.gz` 传到路由器 `/tmp/`，然后执行：
+
+```sh
+mkdir -p /tmp/lan-transfer-addon
+tar -xzf /tmp/lan-transfer-addon.tar.gz -C /tmp/lan-transfer-addon
+sh /tmp/lan-transfer-addon/install.sh
+```
+
+安装器只复制本功能的文件，已有的 `/etc/config/lan-transfer` 保留不动。缺少依赖时会退出并提示，需要先执行 `opkg update && opkg install uhttpd ucode ucode-mod-fs`；`ucode-mod-socket` 可选，装了才会启用内网 STUN。增量安装的文件不在 sysupgrade 保留清单里，升级固件后需要重新安装（v2.11.0 起的 campus-fix 固件已自带）。
+
+## 管理与排错
+
+```sh
+uci set lan-transfer.main.port='8090'; uci commit lan-transfer   # 改端口（或在 LuCI 里改）
+uci set lan-transfer.main.enabled='0'; uci commit lan-transfer   # 关闭
+/etc/init.d/lan-transfer restart
+logread -e uhttpd -e lan-transfer          # 服务日志
+ls /tmp/lan-transfer/peers                 # 当前在线的页面
+```
+
+- **看不到对方**：确认两台设备连的是同一台路由器（不是访客网络），并且打开的是同一个地址；页面右上角应显示「路由器已连接」。
+- **总是「经路由器中转」**：通常是 Wi-Fi 开了 AP 隔离、手机开着 VPN/代理，或浏览器禁用了 WebRTC。中转能用，只是更慢，也会占用路由器 CPU。
+- **页面提示请用内网地址打开**：请用路由器 IP（或 `openwrt.lan`）加端口访问，不要通过端口转发或反向代理访问。
+
+## 验证
+
+```sh
+python tests/test_lan_transfer.py        # 后端、二维码、启动脚本、STUN、文件卫生
+python tests/test_review_fixes.py
+# 浏览器端到端：终端一启动本机模拟服务器（只监听 127.0.0.1），终端二运行测试（需要 playwright 与 Chromium）
+python tests/test_lan_transfer.py --serve --port 8765
+node tests/test_lan_transfer_browser.cjs
+```
+
+- 后端测试覆盖设备发现、会话复用与防冒用、消息顺序与确认、限流、过期清理、Host/Origin 校验、中转分块的权限、窗口背压、重传与清理。Windows 上没有原生 ucode，用 `tests/lan_transfer_ucode_shim.cjs` 模拟；CI 用与固件同版本的原生 ucode `3f64c808` 运行同一组测试，并实跑 STUN 应答器，逐字段核对 RFC 5389 应答。
+- 二维码编码器与 Nayuki 的 `qrcodegen` 参考实现逐模块比对，包括自动掩码选择。
+- 浏览器测试用多个独立上下文和真实 WebRTC，核对实际下载文件的 SHA-256，覆盖：多文件、空文件、中文和特殊字符文件名、ZIP 打包（用 Python `zipfile` 校验 CRC 和内容）、反向传输、拒收、发送方取消、接收方传输中取消、取消后继续、数据被篡改时拒收、文字消息防注入、无 WebRTC 设备的双向中转、直连不通时自动改走中转、双方同时发起连接、改名同步、关闭页面后消失、邀请二维码、手机布局、无页面错误、无外部请求。
+- CI 中端到端测试跑在按固件参数启动的真实 uhttpd（`7e64e8ba`）、原生 ucode 和 STUN 应答器上，并检查浏览器确实拿到了 STUN 反射候选。
+
+尚未在 RM2100 真机上验证，也未覆盖真实的多台手机和电脑组合。
+
+实现依据：[uhttpd CGI 超时与排队](https://github.com/openwrt/uhttpd/blob/7e64e8ba/proc.c)、[请求头映射](https://github.com/openwrt/uhttpd/blob/7e64e8ba/proc.c)、[ucode fs](https://github.com/jow-/ucode/blob/3f64c808/lib/fs.c) 与 [socket 模块](https://github.com/jow-/ucode/blob/3f64c808/lib/socket.c)、[RFC 5389](https://www.rfc-editor.org/rfc/rfc5389)。

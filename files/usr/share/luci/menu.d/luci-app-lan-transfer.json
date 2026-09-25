@@ -1,0 +1,14 @@
+{
+	"admin/services/lan-transfer": {
+		"title": "内网文件互传",
+		"order": 90,
+		"action": {
+			"type": "view",
+			"path": "lan-transfer"
+		},
+		"depends": {
+			"acl": [ "luci-app-lan-transfer" ],
+			"uci": { "lan-transfer": true }
+		}
+	}
+}

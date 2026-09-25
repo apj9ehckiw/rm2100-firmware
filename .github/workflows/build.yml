@@ -14,7 +14,7 @@ on:
       fw_version:
         description: "Firmware version stamp (written to /etc/campus-fix-version and artifact name)"
         required: false
-        default: "2.10.3"
+        default: "2.11.0"
 
 env:
   PROFILE: xiaomi_redmi-router-ac2100
@@ -36,21 +36,73 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl xz-utils zstd ca-certificates busybox python3 cmake libjson-c-dev
+          sudo apt-get install -y curl xz-utils zstd ca-certificates busybox python3 cmake pkg-config libjson-c-dev squashfs-tools
+          # 邻传二维码测试的参考实现（Nayuki qrcodegen，纯 Python）
+          python3 -m pip install --user --break-system-packages qrcodegen==1.8.0
 
-      - name: Build matching host ucode for native RPC smoke tests
+      - name: Build firmware-matching ucode, libubox and uhttpd for native tests
         run: |
-          curl -fL --retry 3 https://github.com/jow-/ucode/archive/3f64c808.tar.gz -o /tmp/ucode.tar.gz
-          mkdir -p /tmp/ucode-src
-          tar -xzf /tmp/ucode.tar.gz --strip-components=1 -C /tmp/ucode-src
-          cmake -S /tmp/ucode-src -B /tmp/ucode-build
-          cmake --build /tmp/ucode-build --target ucode -j2
-          echo "UCODE_BIN=/tmp/ucode-build/ucode" >> "$GITHUB_ENV"
+          # 与固件同版本（见 manifest）：ucode 2025.07.18~3f64c808、libubox 2025.07.23~49056d17、
+          # uhttpd 2025.07.06~7e64e8ba。去掉 -Werror：宿主机 GCC 比固件工具链新，新告警不应阻断测试构建。
+          fetch() {
+            mkdir -p "/tmp/src/$1"
+            curl -fL --retry 3 "https://github.com/$2/archive/$3.tar.gz" -o "/tmp/src/$1.tar.gz"
+            tar -xzf "/tmp/src/$1.tar.gz" --strip-components=1 -C "/tmp/src/$1"
+            sed -i 's/-Werror//g' "/tmp/src/$1/CMakeLists.txt"
+          }
+          fetch libubox openwrt/libubox 49056d17
+          fetch ucode jow-/ucode 3f64c808
+          fetch uhttpd openwrt/uhttpd 7e64e8ba
+          cmake -S /tmp/src/libubox -B /tmp/build/libubox -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_LUA=OFF -DBUILD_EXAMPLES=OFF
+          cmake --build /tmp/build/libubox -j2
+          sudo cmake --install /tmp/build/libubox
+          cmake -S /tmp/src/ucode -B /tmp/build/ucode -DCMAKE_INSTALL_PREFIX=/usr \
+            -DUBUS_SUPPORT=OFF -DUCI_SUPPORT=OFF -DULOOP_SUPPORT=OFF -DRTNL_SUPPORT=OFF -DNL80211_SUPPORT=OFF \
+            -DDIGEST_SUPPORT=OFF -DZLIB_SUPPORT=OFF -DDEBUG_SUPPORT=OFF -DLOG_SUPPORT=OFF
+          cmake --build /tmp/build/ucode -j2
+          sudo cmake --install /tmp/build/ucode
+          cmake -S /tmp/src/uhttpd -B /tmp/build/uhttpd -DTLS_SUPPORT=OFF -DLUA_SUPPORT=OFF -DUBUS_SUPPORT=OFF -DUCODE_SUPPORT=OFF
+          cmake --build /tmp/build/uhttpd -j2
+          sudo ldconfig
+          /usr/bin/ucode -e "import * as socket from 'socket'; import { stat } from 'fs'; print('ucode fs+socket ok\n');"
+          echo "UCODE_BIN=/usr/bin/ucode" >> "$GITHUB_ENV"
+          echo "UHTTPD_BIN=/tmp/build/uhttpd/uhttpd" >> "$GITHUB_ENV"
 
       - name: Test campus overlay regressions
         run: |
           python3 tests/test_review_fixes.py
           python3 tests/test_native_ucode.py
+          python3 tests/test_lan_transfer.py
+
+      - name: Test LAN transfer on real uhttpd, native ucode and STUN in real browsers
+        run: |
+          npm install --prefix /tmp/lt-browser --no-audit --no-fund playwright@1.62.1
+          /tmp/lt-browser/node_modules/.bin/playwright install --with-deps chromium
+          # 绑定本机主网卡地址（相当于路由器 LAN 口），按固件 init 脚本的同一组 uhttpd 参数启动
+          LAN_IP=$(hostname -I | awk '{print $1}')
+          CMD=$(python3 tests/test_lan_transfer.py --stage /tmp/lt/www --bind "$LAN_IP" --port 8765)
+          echo "$CMD"
+          $CMD > /tmp/lt-uhttpd.log 2>&1 &
+          UHTTPD_PID=$!
+          /usr/bin/ucode /tmp/lt/stun.uc "$LAN_IP" 3478 > /tmp/lt-stun.log 2>&1 &
+          STUN_PID=$!
+          trap 'kill "$UHTTPD_PID" "$STUN_PID" 2>/dev/null || true; cat /tmp/lt-uhttpd.log /tmp/lt-stun.log' EXIT
+          for attempt in $(seq 1 30); do
+            curl -fsS "http://$LAN_IP:8765/" -o /dev/null && break
+            sleep 1
+          done
+          python3 tests/test_lan_transfer.py --smoke "http://$LAN_IP:8765"
+          NODE_PATH=/tmp/lt-browser/node_modules LAN_TRANSFER_URL="http://$LAN_IP:8765/" LAN_TRANSFER_STUN=1 \
+            LAN_TRANSFER_SCREENSHOTS=/tmp/lt-shots node tests/test_lan_transfer_browser.cjs
+
+      - name: Upload LAN transfer screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lan-transfer-screenshots
+          path: /tmp/lt-shots
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Download OpenWrt ImageBuilder
         run: |
@@ -65,8 +117,10 @@ jobs:
         run: |
           mkdir -p ib/files
           cp -r files/* ib/files/
+          chmod 0755 ib/files/etc/init.d/lan-transfer ib/files/etc/uci-defaults/92-lan-transfer \
+            ib/files/usr/share/lan-transfer/stun.uc ib/files/usr/share/lan-transfer/www/cgi-bin/api
           # stamp the firmware version into the overlay
-          FWV="${{ github.event.inputs.fw_version || '2.10.3' }}"
+          FWV="${{ github.event.inputs.fw_version || '2.11.0' }}"
           echo "$FWV" > ib/files/etc/campus-fix-version
           sed -i "s|^echo \".*\" > /etc/campus-fix-version|echo \"$FWV\" > /etc/campus-fix-version|"             ib/files/etc/uci-defaults/99-campus-fix-banner
           echo "firmware version: $FWV"
@@ -122,6 +176,8 @@ jobs:
           # 解压（quickauth 应答是 gzip）。带 zlib（LIBCURL_ZLIB default y）
           # 与 ca-bundle（已在镜像里），增量约 +400KB。
           PKGS="$PKGS kmod-ipt-nat ip6tables-nft iptables-nft curl"
+          # 邻传：独立 uhttpd + ucode CGI，include_luci=false 时也能用；socket 模块给内网 STUN 应答器
+          PKGS="$PKGS uhttpd ucode ucode-mod-fs ucode-mod-socket"
           make image \
             PROFILE="$PROFILE" \
             PACKAGES="$PKGS" \
@@ -134,7 +190,7 @@ jobs:
         run: |
           # campus-fix vX.Y.Z 前缀：下载下来一眼可辨版本（breed 刷机界面
           # 只显示文件名，原名一串 openwrt-24.10.2-ramips-... 容易刷错包）
-          FWV="${{ github.event.inputs.fw_version || '2.10.3' }}"
+          FWV="${{ github.event.inputs.fw_version || '2.11.0' }}"
           cd ib/bin/targets/*/*/
           for f in openwrt-*-xiaomi_redmi-router-ac2100-*.bin \
                    openwrt-*-xiaomi_redmi-router-ac2100.manifest; do
@@ -146,10 +202,32 @@ jobs:
           cat sha256sums
           ls -lh campus-fix-v*
 
+      - name: Verify LAN transfer files and packages in the image
+        run: |
+          cd ib/bin/targets/*/*/
+          for pkg in uhttpd ucode ucode-mod-fs ucode-mod-socket; do
+            grep -q "^$pkg - " ./*.manifest || { echo "manifest 缺少 $pkg" >&2; exit 1; }
+          done
+          work=$(mktemp -d)
+          tar -xf ./campus-fix-v*-squashfs-sysupgrade.bin -C "$work"
+          root=$(find "$work" -type f -name root | head -n1)
+          for f in etc/init.d/lan-transfer etc/config/lan-transfer etc/uci-defaults/92-lan-transfer \
+                   usr/share/lan-transfer/stun.uc usr/share/lan-transfer/www/index.html usr/share/lan-transfer/www/app.js \
+                   usr/share/lan-transfer/www/qr.js usr/share/lan-transfer/www/style.css usr/share/lan-transfer/www/cgi-bin/api \
+                   usr/share/luci/menu.d/luci-app-lan-transfer.json usr/share/rpcd/acl.d/luci-app-lan-transfer.json \
+                   usr/share/ucitrack/lan-transfer.json www/luci-static/resources/view/lan-transfer.js; do
+            unsquashfs -cat "$root" "$f" > "$work/check" || { echo "镜像缺少 $f" >&2; exit 1; }
+            cmp "$work/check" "$GITHUB_WORKSPACE/files/$f" || { echo "镜像内容与仓库不一致：$f" >&2; exit 1; }
+          done
+          unsquashfs -lls "$root" usr/lib/ucode/socket.so | grep -q 'socket\.so' || { echo "镜像缺少 socket.so" >&2; exit 1; }
+          unsquashfs -lls "$root" etc/init.d/lan-transfer usr/share/lan-transfer/stun.uc usr/share/lan-transfer/www/cgi-bin/api \
+            | awk '$1 ~ /^-/ { print; if ($1 !~ /^-rwx/) bad = 1 } END { exit bad }'
+          echo "邻传文件、权限与依赖包已在镜像内核对"
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: rm2100-firmware-v${{ github.event.inputs.fw_version || '2.10.3' }}-openwrt-${{ github.event.inputs.openwrt_version || '24.10.2' }}
+          name: rm2100-firmware-v${{ github.event.inputs.fw_version || '2.11.0' }}-openwrt-${{ github.event.inputs.openwrt_version || '24.10.2' }}
           path: |
             ib/bin/targets/*/*/campus-fix-v*-xiaomi_redmi-router-ac2100-squashfs-kernel1.bin
             ib/bin/targets/*/*/campus-fix-v*-xiaomi_redmi-router-ac2100-squashfs-rootfs0.bin

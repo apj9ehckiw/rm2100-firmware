@@ -1,0 +1,11 @@
+{
+	"luci-app-lan-transfer": {
+		"description": "LAN file transfer settings",
+		"read": {
+			"uci": [ "lan-transfer" ]
+		},
+		"write": {
+			"uci": [ "lan-transfer" ]
+		}
+	}
+}

@@ -3,7 +3,9 @@
 红米 RM AC2100（MediaTek MT7621A，128MB RAM / 16MB flash）专用 OpenWrt 固件，
 内置**校园网多设备检测规避**套件，通过 GitHub Actions 云端构建，本机无需 Linux 环境。
 
-**当前固件版本：v2.10.3**（刷入后 `cat /etc/campus-fix-version` 查询；LuCI 页脚也显示 `campus-fix vX.Y.Z`）
+**当前固件版本：v2.11.0**（刷入后 `cat /etc/campus-fix-version` 查询；LuCI 页脚也显示 `campus-fix vX.Y.Z`）
+
+**内网文件互传「邻传」**：连在这台路由器上的手机、电脑用浏览器打开 `http://路由器LAN地址:8080/`（默认 [192.168.1.1:8080](http://192.168.1.1:8080/)）就能互相看到，直接发文件和文字，不用装应用、不用登录后台、不经过外网。详见下方「内网文件互传」一节和 [使用、安装与验证说明](docs/lan-transfer.md)。
 
 ## 功能总览
 
@@ -82,6 +84,15 @@
 - **注意**：密码经明文 HTTP 传输给认证服务器——这是该校 Portal 本身的协议设计，
   与本固件无关；有线/无线校园网内嗅探者理论上可见
 
+### 内网文件互传「邻传」（LuCI「服务 → 内网文件互传」）
+
+- **打开即用**：同一路由器下的设备用浏览器打开 `http://路由器LAN地址:8080/`，自动出现在彼此的「附近的设备」里（随机名字，可改名）。电脑上点「邀请设备」显示二维码，手机扫码即可打开
+- **发文件 / 发文字**：点设备卡片上的按钮或把文件拖上去；对方确认后开始传输，双方都能看到进度、速度、剩余时间，随时可取消。收到的多个文件可「全部保存」或「打包 ZIP」
+- **直连优先，中转兜底**：优先 WebRTC 在设备之间直传（加密，不占路由器 CPU）；路由器 LAN 口上的内网 STUN 应答器帮浏览器拿到真实内网地址，解决部分安卓 / Windows 解析不了 `.local` 地址导致连不上的问题。浏览器不支持 WebRTC 或 9 秒内连不通（如 AP 隔离）时自动改走路由器分块中转（最多占 12 MiB 内存）
+- **不碰网络面**：独立的 uhttpd 实例只绑定 LAN 口 IPv4，不改 LuCI 的 uhttpd、不加任何 nftables 规则（v2.7.0 事故的教训）；状态只放内存盘，重启即清空
+- **限制**：接收的文件先暂存在浏览器里，电脑单次最多 2 GiB、安卓 1 GiB、iPhone 512 MiB；不支持断点续传。微信 / QQ 内打开时会提示改用系统浏览器
+- LuCI 页面可开关功能、改端口；命令行：`uci set lan-transfer.main.enabled='0'; uci commit lan-transfer`
+
 ### 刻意不做的（及理由）
 
 - **不封 DoH**：走 443/TCP 与正常流量无法区分，误伤太大；QUIC 已封，
@@ -124,7 +135,7 @@
 ## 首次进系统检查清单
 
 ```
-cat /etc/campus-fix-version        # 应显示 2.10.3
+cat /etc/campus-fix-version        # 应显示 2.11.0
 nft list chain inet fw4 campus_ttl_postrouting     # counter 在涨 = TTL 归一生效
 nft list chain inet fw4 campus_quic_block          # drop 在涨 = 有客户端试图 QUIC
 nft list chain inet fw4 campus_leak_block          # 发现协议封锁生效
@@ -184,8 +195,13 @@ files/
 │   ├── 20-campus-egress-hygiene.nft # DoT/发现协议/ICMP-ts 封锁 + NTP 重定向 + 可选开关
 │   ├── 25-campus-mss.nft           # MSS clamp（v2.8.0 灰度回归，fw4guard 兜底）
 │   └── 30-campus-synrate.nft       # 聚合 LAN SYN 速率上限（v2.9.0 单条灰度，stateless limit）
+├── etc/init.d/lan-transfer          # 邻传：独立 uhttpd（仅 LAN IPv4）+ 内网 STUN 应答器
+├── etc/config/lan-transfer          # 邻传开关与端口
+├── usr/share/lan-transfer/          # 邻传页面（www/）、CGI 后端（www/cgi-bin/api）、STUN（stun.uc）
+├── usr/share/luci/menu.d/ usr/share/rpcd/acl.d/ www/luci-static/resources/view/  # 邻传 LuCI 设置页
 └── etc/uci-defaults/
     ├── 89-campus-fw4guard           # fw4 规则集自检：加载失败自动隔离 drop-in（保 LAN 永不死）
+    ├── 92-lan-transfer              # 邻传首刷：注册并当场启动服务
     ├── 93-campus-auth               # 自动认证 daemon + LuCI 认证页 + rpcd 后端（v2.10 浏览器会话形态）
     ├── 94-campus-luci-i18n          # LuCI 默认简体中文
     ├── 95-campus-mac-luci           # LuCI「Campus MAC」页面（v2.10 起生成全球单播 OUI MAC）
@@ -236,6 +252,10 @@ files/
 | v2.10.2 | 合并保留 v2.10.1 的认证会话、curl、IP-ID 与 MAC OUI 策略；修复计时函数分秒前导零、封禁记录跨重启保存（原子写入 /etc，兼容旧 /tmp 记录）、防火墙渲染失败检查与查询参数提取；修正 curl 输出参数为 -o -、修复 ucode 全局正则匹配调用及 MAC 十六进制整数转换；新增构建前回归测试及同版本原生 ucode 冒烟测试。 |
 | v2.10.3 | 手动认证收到封禁时保存冷却截止时间，自动服务关闭时也阻止冷却期间重复认证；原子写入及临时记录回退，手动/自动认证共享较晚的截止时间；增加不含凭据的认证结果日志，修正冷却到期及自动恢复提示，并修复状态接口使用不受 ucode 支持的数组 .filter() 导致的报错；新增回归与原生 ucode 测试。此次更新不代表已解决首次偶发代理行为封禁，尚需真机与认证端证据定位。 |
 
+| v2.11.0 | 新增内网文件互传「邻传」：同一路由器下的设备用浏览器打开 `http://路由器LAN地址:8080/`（默认 192.168.1.1:8080）即可互相发现并直传文件与文字，无需登录后台。独立 uhttpd 仅监听 LAN 口 IPv4（不改 LuCI 的 uhttpd、不加防火墙规则），页面/信令/中转后端全部为 ucode CGI，状态只存内存盘 /tmp/lan-transfer；优先 WebRTC DataChannel 直连（LAN 口内置 STUN 应答器解决 mDNS 候选解析失败），不支持 WebRTC 或 9 秒连不通时自动降级为路由器 1 MiB 分块中转（全局上限 12 MiB 内存、4 个并发），CRC32+字节数双重校验拒收损坏文件；单文件上限按设备 512 MiB~2 GiB（浏览器内存），支持多文件、ZIP 打包、文字消息、二维码邀请与 LuCI 开关/改端口设置页。附增量安装包（不刷机可装）。CI 新增：与固件同版本的原生 ucode/libubox/uhttpd 构建并在其上复测全部后端与浏览器端到端测试（含 STUN 实战）、二维码编码器对 Nayuki 参考实现逐模块比对、镜像内容/权限/依赖包逐文件核对。尚未在 RM2100 真机验证。 |
+
 ## 源码回归验证
 
 运行 `python3 tests/test_review_fixes.py`，需要 Python 3.10+、Node.js、curl，以及 BusyBox ash 或 dash。Windows 可使用 Git for Windows。测试使用临时目录及本机 HTTP 服务，不连接校园网；RPC 参数测试使用 Node.js 兼容层；CI 另以固件同版本 ucode 原生执行登录、下线和 MAC 生成冒烟测试。尚未进行真机认证验证。
+
+邻传：`python3 tests/test_lan_transfer.py` 跑后端、二维码、启动脚本、STUN 与文件卫生测试；浏览器端到端测试见 [docs/lan-transfer.md](docs/lan-transfer.md#验证)。CI 在原生 ucode、按固件参数启动的真实 uhttpd 与 STUN 应答器上运行同一组浏览器测试。尚未在 RM2100 真机上验证。
