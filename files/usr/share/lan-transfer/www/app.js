@@ -221,6 +221,19 @@
     if (!res.ok) throw await errorOf(res);
     return res.json();
   }
+  // 信令投递（offer/answer/bye）：偶发的网络抖动或 CGI 排队超时不能让整次
+  // 直连协商白等 30 秒 —— 按 lid 去重是幂等的，短间隔重试两次即可
+  async function sendSignal(peerId, data) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await call('send', { to: peerId, k: 'sig', d: data });
+        return;
+      } catch (e) {
+        if (attempt >= 2 || e.status === 401 || e.status === 404) throw e;
+        await sleep(600 * (attempt + 1));
+      }
+    }
+  }
 
   // ---------- 设备发现（短轮询） ----------
   let pollTimer = 0, polling = false, fastUntil = 0, failures = 0;
@@ -378,7 +391,7 @@
         this.attach(pc.createDataChannel('lt', { ordered: true }));
         const sdp = await localSdp(pc, 'offer');
         if (this.pc === pc) {
-          await call('send', { to: this.peerId, k: 'sig', d: { t: 'offer', lid, sdp } });
+          await sendSignal(this.peerId, { t: 'offer', lid, sdp });
           hurry(ANSWER_TIMEOUT);
         }
       } catch (e) {
@@ -392,7 +405,7 @@
       const ok = await this.settle(Date.now());
       if (!ok && this.lid === lid && !this.open) {
         this.teardown();
-        call('send', { to: this.peerId, k: 'sig', d: { t: 'bye', lid } }).catch(() => {});
+        sendSignal(this.peerId, { t: 'bye', lid }).catch(() => {});
       }
       return ok;
     }
@@ -469,7 +482,7 @@
           await pc.setRemoteDescription(d.sdp);
           const sdp = await localSdp(pc, 'answer');
           if (this.pc !== pc) return;
-          await call('send', { to: this.peerId, k: 'sig', d: { t: 'answer', lid: d.lid, sdp } });
+          await sendSignal(this.peerId, { t: 'answer', lid: d.lid, sdp });
           this.progressAt = Date.now();
           hurry(LINK_TIMEOUT);
         } catch (e) {
