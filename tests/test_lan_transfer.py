@@ -308,6 +308,48 @@ class RelayTests(Case):
         self.assertEqual(self.get(0), (200, None, b'arrived'))
         thread.join()
 
+    def test_slow_download_does_not_lock_upload_or_presence(self):
+        # 堵住 CGI stdout，模拟尚未读走正文的慢接收方。全局锁必须在 emit 前释放。
+        body = b'x' * LIMIT['CHUNK']
+        self.assertEqual(self.put(0, body), 200)
+        request = json.dumps({'a': 'get', **self.session(self.b), 'r': self.rid, 'n': 0}).encode()
+        env = dict(os.environ, REQUEST_METHOD='POST', QUERY_STRING='', CONTENT_TYPE='application/json',
+                   CONTENT_LENGTH=str(len(request)), HTTP_HOST=HOST, HTTP_ORIGIN='http://' + HOST,
+                   SERVER_ADDR='127.0.0.1', SERVER_PORT='8765', REMOTE_ADDR='192.168.1.11')
+        proc = subprocess.Popen(self.backend.command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=env)
+        try:
+            proc.stdin.write(request)
+            proc.stdin.close()
+            proc.stdin = None
+            self.assertIn(b'200', proc.stdout.readline())
+            self.assertIsNone(proc.poll(), '正文应仍被 stdout 背压阻塞')
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(lambda: (self.put(1, b'next'), self.poll(self.a)))
+                try:
+                    self.assertEqual(future.result(timeout=5)[0], 200)
+                finally:
+                    proc.communicate(timeout=5)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+
+    def test_large_sequence_and_reordered_uploads(self):
+        # 跳过旧的七位序号上限，不必实际传输数 TB 数据。
+        path = self.backend.state / 'relay' / self.rid / 'meta.json'
+        meta = json.loads(path.read_text(encoding='utf-8'))
+        n = 10000000
+        meta['low'] = n
+        path.write_text(json.dumps(meta), encoding='utf-8')
+        self.assertEqual(self.put(n + 1, b'second', crc='0badc0de'), 200)
+        self.assertEqual(self.put(n, b'first'), 200)
+        self.assertEqual(self.get(n), (200, None, b'first'))
+        self.assertEqual(self.get(n + 1), (200, '0badc0de', b'second'))
+        self.assertEqual(self.put(n, b'first'), 200)
+        self.assertEqual(self.put(9007199254740992, b'invalid'), 400)
+        self.assertEqual(self.get(9007199254740992)[0], 400)
+
     def test_relay_caps_and_cleanup(self):
         for _ in range(LIMIT['RELAY_MAX'] - 1):
             self.assertEqual(self.call({'a': 'ropen', **self.session(self.a), 'to': self.b['id']})[0], 200)
@@ -317,6 +359,26 @@ class RelayTests(Case):
         self.poll(self.a)
         self.assertEqual(list((self.backend.state / 'relay').iterdir()), [], '对端离线后清理中转')
         self.assertEqual(self.put(1, b'data'), 404)
+
+
+class ZipTests(unittest.TestCase):
+    def test_zip32_boundary_includes_utf8_names(self):
+        script = r"""
+const fs = require('node:fs'), assert = require('node:assert/strict');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+const start = source.indexOf('  function zipBlob(files) {');
+const end = source.indexOf('  function saveZip(files) {', start);
+assert.ok(start > 0 && end > start);
+const zip = new Function('files', source.slice(start, end) + '\nreturn zipBlob(files);');
+const name = '测'.repeat(200) + '.bin';
+const blob = new Blob(['abc']);
+assert.equal(zip([{ name, size: 3, crc: 0, blob }]).size,
+  22 + 30 + 46 + 2 * new TextEncoder().encode(name).length + 3);
+// 只模拟元数据，正文不分配数 GB。旧的正文+100 字节估算会放过这个文件。
+assert.throws(() => zip([{ name, size: 0xffffffff - 1000, crc: 0, blob }]), /逐个保存/);
+"""
+        result = subprocess.run(['node', '-e', script, str(WWW / 'app.js')], capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class QrTests(unittest.TestCase):

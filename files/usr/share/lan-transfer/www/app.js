@@ -6,6 +6,7 @@
   const MiB = 1048576;
   const HEADER = 4;                  // 直连二进制分包头：u32 批次号
   const SLICE = MiB;                 // 发送端每次从磁盘读 1 MiB
+  const RELAY_INFLIGHT = 2;          // 两块上传流水线，隐藏读盘和 HTTP 往返；接收仍顺序确认
   const HIGH_WATER = 8 * MiB;        // DataChannel 发送缓冲上限
   const LOW_WATER = 2 * MiB;
   const CONSOLIDATE = 16 * MiB;      // 接收端每攒 16 MiB 合成 Blob，交给浏览器托管（大文件可落盘）
@@ -177,8 +178,7 @@
 
   const device = detectDevice();
   const RTC = typeof RTCPeerConnection === 'function';
-  // 接收的文件先放在浏览器内存/临时存储里，手机（尤其 iOS）要保守
-  const LIMIT = device.os === 'iOS' || device.os === 'iPadOS' ? 512 * MiB : device.mobile ? 1024 * MiB : 2048 * MiB;
+  // 不按设备类型限制文件大小；实际容量由浏览器的 Blob 临时存储和设备剩余空间决定。
   const me = { id: null, key: null, ip: '', name: cleanName(storage.get('lt-name')) || pick(COLORS) + pick(ANIMALS) };
   storage.set('lt-name', me.name);
   const server = { stun: null, chunk: MiB };
@@ -189,8 +189,6 @@
   const tiles = new Map();
   const kept = new Set();            // 已结束但仍持有文件的接收记录
   let autoSave = storage.get('lt-autosave', device.os === 'iOS' || device.os === 'iPadOS' ? '0' : '1') === '1';
-  let retained = 0, reserved = 0;
-  const capacityLeft = () => Math.max(0, LIMIT - retained - reserved);
 
   // ---------- 与路由器通信 ----------
   class ApiError extends Error {
@@ -243,7 +241,7 @@
   async function hello() {
     let saved = null;
     try { saved = JSON.parse(storage.sget('lt-session') || 'null'); } catch (_) { saved = null; }
-    const r = await call('hello', { id: saved?.id, key: saved?.key, name: me.name, dev: devString, rtc: RTC ? 1 : 0, max: LIMIT });
+    const r = await call('hello', { id: saved?.id, key: saved?.key, name: me.name, dev: devString, rtc: RTC ? 1 : 0, max: 0 });
     if (!TOKEN.test(r.id) || !TOKEN.test(r.key)) throw new ApiError(0, '路由器返回了无效的会话');
     if (r.id !== saved?.id) { lastAck = 0; storage.sset('lt-ack', '0'); }
     me.id = r.id; me.key = r.key; me.ip = typeof r.ip === 'string' ? r.ip : '';
@@ -564,12 +562,9 @@
       if (!f || typeof f.name !== 'string' || !Number.isSafeInteger(f.size) || f.size < 0) return;
       files.push({ name: safeFileName(f.name), size: f.size });
       total += f.size;
+      if (!Number.isSafeInteger(total)) return;
     }
     const t = new Incoming(from, msg, via, files, total);
-    if (total > capacityLeft()) {
-      t.decline(`对方设备可用空间不足（还能接收 ${sizeText(capacityLeft())}）`);
-      return;
-    }
     queuePrompt(t);
   }
 
@@ -768,20 +763,31 @@
     }
     async sendRelay(i) {
       const file = this.files[i];
+      const pending = [];
       let crc = 0;
-      for (let offset = 0; offset < file.size;) {
-        const buf = new Uint8Array(await readSlice(file.slice(offset, offset + this.chunk), file.name));
-        this.check();
-        if (!buf.length) throw new Error(`读取「${file.name}」失败`);
-        crc = crc32(crc, buf);
-        await this.put(buf, offset + buf.length >= file.size ? crc : null);
-        this.seq++;
-        offset += buf.length;
-        this.progress(buf.length);
+      try {
+        for (let offset = 0; offset < file.size;) {
+          if (pending.length >= RELAY_INFLIGHT) await pending.shift();
+          this.check();
+          const buf = new Uint8Array(await readSlice(file.slice(offset, offset + this.chunk), file.name));
+          this.check();
+          if (!buf.length) throw new Error(`读取「${file.name}」失败`);
+          crc = crc32(crc, buf);
+          // 序号在发起请求前固定；重试不能读到下一块的序号。
+          const upload = this.put(buf, offset + buf.length >= file.size ? crc : null, this.seq++)
+            .then(() => { this.check(); this.progress(buf.length); });
+          upload.catch(() => {});  // 后一块可能先失败，排到它时再传播错误
+          pending.push(upload);
+          offset += buf.length;
+        }
+        await Promise.all(pending);
+      } finally {
+        // 失败/取消时收拢在途请求，避免未处理的 rejection。
+        await Promise.allSettled(pending);
       }
     }
-    async put(buf, crc) {
-      const query = `?a=put&id=${me.id}&key=${me.key}&r=${this.rid}&n=${this.seq}` + (crc === null ? '' : `&c=${hex8(crc)}`);
+    async put(buf, crc, seq) {
+      const query = `?a=put&id=${me.id}&key=${me.key}&r=${this.rid}&n=${seq}` + (crc === null ? '' : `&c=${hex8(crc)}`);
       const since = Date.now();
       for (let attempt = 0; ;) {
         this.check();
@@ -887,8 +893,9 @@
       files = files.slice(0, BATCH_MAX);
     }
     const total = files.reduce((sum, f) => sum + f.size, 0);
+    if (!Number.isSafeInteger(total)) return toast('文件总大小无法准确表示，请分批发送', true);
     if (peer.max && total > peer.max) {
-      toast(`${peer.name} 一次最多接收 ${sizeText(peer.max)}，请分批发送`, true);
+      toast(`${peer.name} 的页面仍限制接收 ${sizeText(peer.max)}，请让对方刷新到新版后再发送`, true);
       return;
     }
     new Outgoing(peer, files);
@@ -915,7 +922,6 @@
       this.pending = [];
       this.pendingBytes = 0;
       this.parts = [];
-      this.held = 0;
       this.speed = new Speed();
       incoming.set(this.key, this);
       this.ui = makeCard('in');
@@ -961,14 +967,8 @@
     }
     accept() {
       if (this.state !== 'ask') return;
-      if (this.total > capacityLeft()) {
-        this.decline(`对方设备可用空间不足（还能接收 ${sizeText(capacityLeft())}）`);
-        return;
-      }
       clearTimeout(this.expire);
       dropPrompt(this);
-      reserved += this.total;
-      this.held = this.total;
       this.state = 'receiving';
       this.ui.card.dataset.state = 'active';
       this.lastData = Date.now();
@@ -1026,9 +1026,6 @@
       this.crc = 0;
       this.fileBytes = 0;
       this.cur++;
-      this.held -= file.size;
-      reserved -= file.size;
-      retained += file.size;
       this.readyRow(i);
       if (autoSave) saveFile(file);
       if (this.via === 'p2p') Promise.resolve().then(() => this.reply({ t: 'got', bid: this.bid, i })).catch(() => {});
@@ -1122,8 +1119,6 @@
       this.state = state;
       clearTimeout(this.expire);
       clearInterval(this.watchdog);
-      reserved -= this.held;
-      this.held = 0;
       this.pending = [];
       this.parts = [];
       if (this.rid) call('rclose', { r: this.rid }).catch(() => {});
@@ -1152,7 +1147,6 @@
   function releaseFile(file) {
     if (!file.url) return;
     URL.revokeObjectURL(file.url);
-    retained -= file.size;
     file.url = null;
     file.blob = null;
   }
@@ -1209,6 +1203,9 @@
       offset += 30 + bytes.length + file.size;
     }
     const size = central.reduce((sum, p) => sum + p.byteLength, 0);
+    // 包含 UTF-8 文件名和重名后缀的真实目录长度；不能只按文件正文估算 ZIP32 边界。
+    if (offset + size >= 0xffffffff || files.length >= 0xffff)
+      throw new Error('文件太多或太大，无法打包，请逐个保存');
     const end = new DataView(new ArrayBuffer(22));
     end.setUint32(0, 0x06054b50, true);
     end.setUint16(8, files.length, true);
@@ -1221,7 +1218,9 @@
     const total = files.reduce((sum, f) => sum + f.size + 100, 0);
     if (total >= 0xffffffff || files.length >= 0xffff) return toast('文件太多或太大，无法打包，请逐个保存', true);
     const d = new Date(), pad = n => String(n).padStart(2, '0');
-    const url = URL.createObjectURL(zipBlob(files));
+    let url;
+    try { url = URL.createObjectURL(zipBlob(files)); }
+    catch (e) { return toast(e.message || '浏览器无法打包，请逐个保存', true); }
     const a = h('a', { href: url, download: `邻传-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.zip`, hidden: true });
     document.body.append(a);
     a.click();

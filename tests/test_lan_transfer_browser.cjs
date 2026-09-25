@@ -20,6 +20,7 @@ async function device(browser, name, opts = {}) {
   const ctx = await browser.newContext({
     acceptDownloads: true,
     viewport: opts.mobile ? { width: 390, height: 844 } : { width: 1280, height: 900 },
+    ...(opts.userAgent ? { userAgent: opts.userAgent } : {}),
     isMobile: !!opts.mobile, hasTouch: !!opts.mobile
   });
   await ctx.addInitScript(([name, noRtc, blockDirect, hidden]) => {
@@ -123,7 +124,7 @@ assert got == json.loads(sys.argv[2]), got
       await alice.page.locator('#empty').waitFor();
       await alice.page.screenshot({ path: path.join(SHOTS, 'empty.png'), fullPage: true });
     }
-    const bob = await device(browser, '小明手机', { mobile: true });
+    const bob = await device(browser, '小明手机', { mobile: true, userAgent: 'Mozilla/5.0 (Linux; Android 14) Chrome/130.0 Mobile' });
     const carol = await device(browser, '旧浏览器', { noRtc: true });
     for (const [a, b] of [[alice, bob], [alice, carol], [bob, alice], [carol, alice]]) await tile(a, b);
     assert.match(await (await tile(alice, carol)).locator('.peer-tags').textContent(), /中转/);
@@ -229,9 +230,63 @@ assert got == json.loads(sys.argv[2]), got
     await message.locator('button', { hasText: '关闭' }).click();
     console.log('PASS 文字消息原样显示且不会被当作 HTML');
 
-    await transfer(alice, carol, [{ name: 'relay.bin', data: crypto.randomBytes(3 * 1024 * 1024 + 5) }, { name: 'relay-empty.txt', data: Buffer.alloc(0) }], 'relay');
+    // 第一块已写入后丢弃一次应答：第二块可先完成，第一块重试时序号必须不变。
+    await alice.page.evaluate(() => {
+      const original = window.fetch;
+      window.__uploads = { active: 0, peak: 0, retried: false };
+      window.fetch = async function (url, opts) {
+        if (!String(url).includes('?a=put')) return original.call(this, url, opts);
+        const stats = window.__uploads;
+        stats.peak = Math.max(stats.peak, ++stats.active);
+        try {
+          const res = await original.call(this, url, opts);
+          if (String(url).includes('&n=0') && !stats.retried) {
+            stats.retried = true;
+            throw new TypeError('模拟已提交分块的应答丢失');
+          }
+          await new Promise(resolve => setTimeout(resolve, 100));
+          return res;
+        } finally { stats.active--; }
+      };
+    });
+    await transfer(alice, carol, [{ name: 'relay.bin', data: crypto.randomBytes(9 * 1024 * 1024 + 5) }, { name: 'relay-empty.txt', data: Buffer.alloc(0) }], 'relay');
+    const uploads = await alice.page.evaluate(() => window.__uploads);
+    assert.equal(uploads.peak, 2, '应有两块在途上传且不超过窗口');
+    assert.equal(uploads.retried, true);
+    await offer(alice, carol, [{ name: 'relay-cancel.bin', data: crypto.randomBytes(12 * 1024 * 1024) }]);
+    await (await prompt(carol, alice)).locator('.btn.primary').click();
+    await carol.page.waitForFunction(() => {
+      const value = Number(document.querySelector('.xfer[data-dir="in"] .bar')?.getAttribute('aria-valuenow'));
+      return value > 0 && value < 90;
+    });
+    await newest(carol.page, 'in').locator('button', { hasText: '取消' }).click();
+    await state(carol.page, 'in', 'cancelled');
+    await state(alice.page, 'out', 'cancelled');
+    assert.equal(await newest(carol.page, 'in').locator('button', { hasText: '保存' }).count(), 0);
+    await alice.page.waitForFunction(() => window.__uploads.active === 0);
+    console.log('PASS 两块并行中转在应答丢失后重试、校验一致，传输中取消回收在途请求');
     await transfer(carol, alice, [{ name: '回传.bin', data: crypto.randomBytes(1024 * 1024) }], 'relay');
     console.log('PASS 不支持 WebRTC 时经路由器中转（双向，含整块边界与空文件）');
+
+    // 仅模拟大文件元数据：不占用数 GB 内存。接收后故意读不到正文，应报读取失败而非容量拒收。
+    await carol.page.evaluate(() => {
+      const size = Object.getOwnPropertyDescriptor(Blob.prototype, 'size').get;
+      Object.defineProperty(Blob.prototype, 'size', { configurable: true, get() {
+        return this.name === 'large-size-probe.bin' ? 5 * 1024 ** 3 : size.call(this);
+      } });
+    });
+    const iphone = await device(browser, '苹果手机', { mobile: true, userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile Safari/604.1' });
+    for (const receiver of [alice, bob, iphone]) {
+      await offer(carol, receiver, [{ name: 'large-size-probe.bin', data: Buffer.from('x') }]);
+      const dialog = await prompt(receiver, carol);
+      assert.match(await dialog.textContent(), /5.00 GB/);
+      await dialog.locator('.btn.primary').click();
+      const failed = await state(carol.page, 'out', 'failed');
+      assert.match(await failed.locator('.xfer-status').textContent(), /读取/);
+      await state(receiver.page, 'in', 'failed');
+    }
+    await iphone.ctx.close();
+    console.log('PASS 电脑、Android、iOS 均允许 5 GiB 文件进入接收流程（元数据测试）');
 
     const dave = await device(browser, '隔离设备', { blockDirect: true });
     const started = Date.now();

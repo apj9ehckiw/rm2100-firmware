@@ -3,7 +3,7 @@
 红米 RM AC2100（MediaTek MT7621A，128MB RAM / 16MB flash）专用 OpenWrt 固件，
 内置**校园网多设备检测规避**套件，通过 GitHub Actions 云端构建，本机无需 Linux 环境。
 
-**当前固件版本：v2.11.0**（刷入后 `cat /etc/campus-fix-version` 查询；LuCI 页脚也显示 `campus-fix vX.Y.Z`）
+**当前固件版本：v2.11.1**（刷入后 `cat /etc/campus-fix-version` 查询；LuCI 页脚也显示 `campus-fix vX.Y.Z`）
 
 **内网文件互传「邻传」**：连在这台路由器上的手机、电脑用浏览器打开 `http://路由器LAN地址:8080/`（默认 [192.168.1.1:8080](http://192.168.1.1:8080/)）就能互相看到，直接发文件和文字，不用装应用、不用登录后台、不经过外网。详见下方「内网文件互传」一节和 [使用、安装与验证说明](docs/lan-transfer.md)。
 
@@ -90,7 +90,7 @@
 - **发文件 / 发文字**：点设备卡片上的按钮或把文件拖上去；对方确认后开始传输，双方都能看到进度、速度、剩余时间，随时可取消。收到的多个文件可「全部保存」或「打包 ZIP」
 - **直连优先，中转兜底**：优先 WebRTC 在设备之间直传（加密，不占路由器 CPU）；路由器 LAN 口上的内网 STUN 应答器帮浏览器拿到真实内网地址，解决部分安卓 / Windows 解析不了 `.local` 地址导致连不上的问题。浏览器不支持 WebRTC 或 9 秒内连不通（如 AP 隔离）时自动改走路由器分块中转（最多占 12 MiB 内存）
 - **不碰网络面**：独立的 uhttpd 实例只绑定 LAN 口 IPv4，不改 LuCI 的 uhttpd、不加任何 nftables 规则（v2.7.0 事故的教训）；状态只放内存盘，重启即清空
-- **限制**：接收的文件先暂存在浏览器里，电脑单次最多 2 GiB、安卓 1 GiB、iPhone 512 MiB；不支持断点续传。微信 / QQ 内打开时会提示改用系统浏览器
+- **文件大小**：v2.11.1 不设固定接收上限，实际容量取决于浏览器和设备剩余空间；ZIP 打包使用 ZIP32，约 4 GiB 以上请逐个保存。不支持断点续传。微信 / QQ 内打开时会提示改用系统浏览器
 - LuCI 页面可开关功能、改端口；命令行：`uci set lan-transfer.main.enabled='0'; uci commit lan-transfer`
 
 ### 刻意不做的（及理由）
@@ -103,7 +103,7 @@
 ## 使用方法
 
 1. **构建**：本仓库已配好 Actions。进 **Actions → Build RM AC2100 OpenWrt
-   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.9.2）直接 Run，
+   firmware → Run workflow**，默认参数（24.10.2 + LuCI + Argon 主题 + 简体中文 + v2.11.1）直接 Run，
    约 3-5 分钟出包。可调输入：
    - `openwrt_version`：OpenWrt 底包版本
    - `include_luci`：是否带 LuCI（false = 纯 CLI，省内存）
@@ -135,7 +135,7 @@
 ## 首次进系统检查清单
 
 ```
-cat /etc/campus-fix-version        # 应显示 2.11.0
+cat /etc/campus-fix-version        # 应显示 2.11.1
 nft list chain inet fw4 campus_ttl_postrouting     # counter 在涨 = TTL 归一生效
 nft list chain inet fw4 campus_quic_block          # drop 在涨 = 有客户端试图 QUIC
 nft list chain inet fw4 campus_leak_block          # 发现协议封锁生效
@@ -253,6 +253,8 @@ files/
 | v2.10.3 | 手动认证收到封禁时保存冷却截止时间，自动服务关闭时也阻止冷却期间重复认证；原子写入及临时记录回退，手动/自动认证共享较晚的截止时间；增加不含凭据的认证结果日志，修正冷却到期及自动恢复提示，并修复状态接口使用不受 ucode 支持的数组 .filter() 导致的报错；新增回归与原生 ucode 测试。此次更新不代表已解决首次偶发代理行为封禁，尚需真机与认证端证据定位。 |
 
 | v2.11.0 | 新增内网文件互传「邻传」：同一路由器下的设备用浏览器打开 `http://路由器LAN地址:8080/`（默认 192.168.1.1:8080）即可互相发现并直传文件与文字，无需登录后台。独立 uhttpd 仅监听 LAN 口 IPv4（不改 LuCI 的 uhttpd、不加防火墙规则），页面/信令/中转后端全部为 ucode CGI，状态只存内存盘 /tmp/lan-transfer；优先 WebRTC DataChannel 直连（LAN 口内置 STUN 应答器解决 mDNS 候选解析失败），不支持 WebRTC 或 9 秒连不通时自动降级为路由器 1 MiB 分块中转（全局上限 12 MiB 内存、4 个并发），CRC32+字节数双重校验拒收损坏文件；单文件上限按设备 512 MiB~2 GiB（浏览器内存），支持多文件、ZIP 打包、文字消息、二维码邀请与 LuCI 开关/改端口设置页。附增量安装包（不刷机可装）。CI 新增：与固件同版本的原生 ucode/libubox/uhttpd 构建并在其上复测全部后端与浏览器端到端测试（含 STUN 实战）、二维码编码器对 Nayuki 参考实现逐模块比对、镜像内容/权限/依赖包逐文件核对。尚未在 RM2100 真机验证。 |
+
+| v2.11.1 | 取消邻传按设备设置的 512 MiB / 1 GiB / 2 GiB 文件大小上限；实际接收能力仍受浏览器临时存储与设备剩余空间约束。路由器中转采用两块并行上传，并在输出下载正文前释放共享状态锁，减少上传、下载和设备发现互相排队；扩展分块序号范围，修正 ZIP32 边界判断。后端与浏览器端到端增加慢下载、乱序上传、丢失应答重试、取消及 5 GiB 文件元数据测试。尚未在 RM2100 真机测量传输速度。 |
 
 ## 源码回归验证
 

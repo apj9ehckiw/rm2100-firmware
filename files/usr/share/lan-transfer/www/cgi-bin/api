@@ -331,10 +331,12 @@ function relay_bytes() {
 }
 
 function act_put(q, body) {
-	if (type(q.n) != 'string' || match(q.n, /^[0-9]{1,7}$/) == null
+	if (type(q.n) != 'string' || match(q.n, /^[0-9]{1,16}$/) == null
 	    || (q.c != null && match(q.c, /^[0-9a-f]{8}$/) == null))
 		return fail(400, '无效的分块参数');
 	let n = int(q.n);
+	if (n > 9007199254740991)
+		return fail(400, '无效的分块参数');
 	let r = relay_open(q, 'from');
 	if (r.err != null)
 		return r.err;
@@ -367,7 +369,7 @@ function act_put(q, body) {
 }
 
 function act_get(d) {
-	if (type(d.n) != 'int' || d.n < 0)
+	if (type(d.n) != 'int' || d.n < 0 || d.n > 9007199254740991)
 		return fail(400, '无效的分块序号');
 	let r = relay_open(d, 'to');
 	if (r.err != null)
@@ -501,4 +503,8 @@ catch (e) {
 	warn(sprintf('lan-transfer: %s\n', e));
 	out = fail(500, '服务内部错误');
 }
+// 响应正文已经读入进程内存。此后不再访问共享状态，先放锁再输出：
+// stdout 管道会受下载方网速背压，持锁输出会串行化所有上传、下载和设备发现。
+if (lockfh != null)
+	lockfh.lock('u');
 emit(out);
