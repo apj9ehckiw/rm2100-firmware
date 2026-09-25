@@ -44,11 +44,13 @@ jobs:
         run: |
           # 与固件同版本（见 manifest）：ucode 2025.07.18~3f64c808、libubox 2025.07.23~49056d17、
           # uhttpd 2025.07.06~7e64e8ba。去掉 -Werror：宿主机 GCC 比固件工具链新，新告警不应阻断测试构建。
+          # libubox 会写 -Werror=implicit-function-declaration 这类带值的选项，只删 -Werror
+          # 会留下孤立的 =xxx，被 GCC 当链接输入报错；统一替换为 -Wno-error=<具体项> 或 -Wno-error。
           fetch() {
             mkdir -p "/tmp/src/$1"
             curl -fL --retry 3 "https://github.com/$2/archive/$3.tar.gz" -o "/tmp/src/$1.tar.gz"
             tar -xzf "/tmp/src/$1.tar.gz" --strip-components=1 -C "/tmp/src/$1"
-            sed -i 's/-Werror//g' "/tmp/src/$1/CMakeLists.txt"
+            sed -i -E 's/-Werror=([a-zA-Z0-9-]+)/-Wno-error=\1/g; s/-Werror([^=]|$)/-Wno-error\1/g' "/tmp/src/$1/CMakeLists.txt"
           }
           fetch libubox openwrt/libubox 49056d17
           fetch ucode jow-/ucode 3f64c808
